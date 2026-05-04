@@ -14,6 +14,12 @@ __pycache__/
 # User-recorded command history can be large and model-specific
 command1.tcl
 
+# Local model-specific case scripts/notes. Keep them locally if useful, but do
+# not publish them as generic MCP behavior.
+*_cutsection_spin_notes.md
+mesh_*_strategy_*.tcl
+repair_*_bad_vol.tcl
+
 # Unrelated local downloads/tools in this folder
 CC-desktop-zh-cn-WIN-portable/
 claude-code-zh-cn-main/
@@ -23,4 +29,3 @@ claude-code-zh-cn-main.tar.gz
 *.log
 *.tmp
 *.bak
-

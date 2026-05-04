@@ -54,49 +54,61 @@ HyperMesh meshing strategy for this workstation:
 8. Do not overuse drag. Use spin where the geometry is a clean revolved part;
    use tetra when drag/spin would force bad topology.
 9. Component names should describe the physical object, not the mesh type.
-   Examples: flange, bearing_6903_left, cutout_body, spacer_block_left_upper.
+   Examples: housing, shaft_ring, spacer_block_upper, support_flange.
 10. Do not repair quality by blindly refining the whole mesh. Prefer strategy
    changes, local 3D smoothing/remesh, or sliver-tetra repair. If bad volume
    elements still cannot be fixed, keep them in the model and report them; do
    not delete unfixable quality-failed elements unless the user explicitly asks.
 """
 
-A_HM_MESHING_PLAN = {
-    "tetra_surface_deviation_rtrias": [
-        "flange_outer_fillet",
-        "cutout_body",
-        "rounded_flange_fillet",
-        "ring_spacer",
-        "boss_body",
-        "boss_cutout",
-        "bearing_1730_cover",
-        "main_flange",
-        "moved_face_housing",
-        "chamfered_flange_edge",
-        "bearing_6903_inner_ring_left",
-        "bearing_6903_outer_ring_left",
-        "bearing_6903_inner_ring_right",
-        "bearing_6903_outer_ring_right",
-    ],
-    "drag_hex_guarded": [
-        "extruded_plate_left",
-        "extruded_plate_right",
-        "thin_extruded_plate",
-        "bearing_1730_ring_left",
-        "bearing_1730_ring_right",
-        "spacer_block_left_upper",
-        "spacer_block_left_lower",
-        "spacer_block_right_upper",
-        "spacer_block_right_lower",
-    ],
-    "spin_hex_guarded": [
-        "bearing_6903_left",
-        "bearing_6903_right",
-    ],
-    "cutsection_spin_hex": [],
+GENERIC_MESHING_RULES = {
+    "tetra_surface_deviation_rtrias": {
+        "use_when": [
+            "flanges or flange-like bodies",
+            "parts with bolt holes, local holes, bosses, protrusions, ribs, grooves, cutouts, or non-sweepable topology",
+            "parts whose source face cannot be proven as 100% quads with matched edge seeds",
+            "fallback for ambiguous geometry",
+        ],
+        "required_checks": [
+            "2D surface mesh aspect cleanup before tetramesh",
+            "per-component tetramesh; do not mix several solids into one component",
+            "3D volume quality check and local repair/report",
+        ],
+    },
+    "drag_hex_guarded": {
+        "use_when": [
+            "simple straight extrusion or tube with constant section",
+            "a real source face exists at one end of the extrusion",
+            "all logical source-face edge groups can be forced to matched seed counts",
+            "the source face meshes as 100% quads",
+        ],
+        "fallback": "tetra_surface_deviation_rtrias",
+    },
+    "spin_hex_guarded": {
+        "use_when": [
+            "clean revolved solid",
+            "the selected source surface is already a true cross-section",
+            "the source section meshes as 100% quads",
+        ],
+        "fallback": "cutsection_spin_hex for stepped/recessed revolved solids; otherwise tetra_surface_deviation_rtrias",
+    },
+    "cutsection_spin_hex": {
+        "use_when": [
+            "stepped, recessed, or ambiguous revolved solid",
+            "no existing face can be trusted as the spin section",
+            "a middle cutting plane through the rotation axis can be defined",
+        ],
+        "method": [
+            "split the actual solid with body_splitmerge_with_plane",
+            "detect newly created surfaces that lie on the cutting plane",
+            "accept only all-quad section meshes on that plane",
+            "spin the accepted 2D section into 3D hex elements",
+        ],
+        "fallback": "tetra_surface_deviation_rtrias",
+    },
 }
 
-A_HM_SPECIAL_WORKFLOWS = {
+SPECIAL_WORKFLOWS = {
     "visible_gui_mode": {
         "recommended": True,
         "listener_port": DEFAULT_GUI_PORT,
@@ -130,7 +142,6 @@ A_HM_SPECIAL_WORKFLOWS = {
         ),
     },
     "quality_policy": {
-        "repair_script": r"F:\mcp\repair_v12_bad_vol.tcl",
         "policy": (
             "Try smoothing/sliver repair, but leave unfixable bad volume elements "
             "in the model and log their IDs. Do not delete them automatically."
@@ -374,27 +385,22 @@ def get_hypermesh_meshing_strategy() -> dict[str, Any]:
     return {
         "success": True,
         "strategy": HYPERMESH_MESHING_STRATEGY.strip(),
-        "a_hm_plan": A_HM_MESHING_PLAN,
-        "special_workflows": A_HM_SPECIAL_WORKFLOWS,
+        "generic_rules": GENERIC_MESHING_RULES,
+        "special_workflows": SPECIAL_WORKFLOWS,
         "default_hmbatch": str(DEFAULT_HMBATCH),
     }
 
 
 @mcp.tool()
-def get_a_hm_meshing_plan() -> dict[str, Any]:
-    """Return the latest model-specific meshing plan for F:\\a.hm."""
+def get_meshing_rules() -> dict[str, Any]:
+    """Return generic HyperMesh meshing rules without hard-coded component names."""
     return {
         "success": True,
-        "input_model": r"F:\a.hm",
-        "latest_output": r"F:\a_meshed_strategy_v17_cutsection_spin.hm",
-        "latest_script": r"F:\mcp\mesh_a_strategy_v17_cutsection_spin.tcl",
-        "latest_report": r"F:\a_meshed_strategy_v17_cutsection_spin_report.txt",
-        "baseline_model_for_v17": r"F:\a_meshed_strategy_v12.hm",
-        "plan": A_HM_MESHING_PLAN,
-        "special_workflows": A_HM_SPECIAL_WORKFLOWS,
+        "generic_rules": GENERIC_MESHING_RULES,
+        "special_workflows": SPECIAL_WORKFLOWS,
         "notes": [
-            "cutout_body and main_flange are treated as flange/complex tetra parts, not drag parts.",
-            "drag_hex_guarded entries still require 100% quad source-face verification before drag.",
+            "Do not decide tetra/drag/spin by component name.",
+            "Classify by geometry: holes/flanges/bosses/cutouts -> tetra; simple constant extrusions with matched quad source face -> drag; clean true cross-section revolved bodies -> spin.",
             "For stepped or recessed revolved solids, use the generic cut-section spin workflow rather than guessed surface-id spin.",
             "quality cleanup should prefer strategy changes and local repair; do not blindly refine or delete unfixable bad elements.",
             "visible GUI mode changes where the Tcl runs; meshing logic and input/output paths remain explicit.",
@@ -407,9 +413,9 @@ def get_cutsection_spin_workflow() -> dict[str, Any]:
     """Return the generic cut-section spin workflow for stepped/recessed revolved solids."""
     return {
         "success": True,
-        "workflow": A_HM_SPECIAL_WORKFLOWS["cutsection_spin_hex"],
-        "gui_mode": A_HM_SPECIAL_WORKFLOWS["visible_gui_mode"],
-        "quality_policy": A_HM_SPECIAL_WORKFLOWS["quality_policy"],
+        "workflow": SPECIAL_WORKFLOWS["cutsection_spin_hex"],
+        "gui_mode": SPECIAL_WORKFLOWS["visible_gui_mode"],
+        "quality_policy": SPECIAL_WORKFLOWS["quality_policy"],
     }
 
 
@@ -423,6 +429,7 @@ def classify_hypermesh_part_strategy(
     is_simple_straight_tube: bool = False,
     is_constant_section_extrusion: bool = False,
     is_clean_revolved_section: bool = False,
+    is_stepped_or_recessed_revolved: bool = False,
     source_faces_can_be_all_quads: bool = False,
     matched_inner_outer_seed_counts: bool = False,
 ) -> dict[str, Any]:
@@ -433,6 +440,20 @@ def classify_hypermesh_part_strategy(
 
     looks_like_flange = is_flange or any(word in text for word in flange_words)
     looks_like_bolted = has_bolt_holes or any(word in text for word in bolt_words)
+    stepped_tokens = (
+        "step",
+        "stepped",
+        "recess",
+        "recessed",
+        "groove",
+        "grooved",
+        "凹",
+        "台阶",
+        "槽",
+    )
+    looks_stepped_revolved = is_stepped_or_recessed_revolved or (
+        is_clean_revolved_section and any(word in text for word in stepped_tokens)
+    )
 
     if looks_like_flange or looks_like_bolted:
         return {
@@ -475,6 +496,23 @@ def classify_hypermesh_part_strategy(
             "required_checks": [
                 "2D aspect <= 10 after cleanup",
                 "3D vol skew <= 0.99 after repair",
+            ],
+        }
+
+    if looks_stepped_revolved and not has_boss_or_protrusion:
+        return {
+            "success": True,
+            "strategy": "cutsection_spin_hex",
+            "reason": (
+                "Stepped/recessed revolved body: split the actual solid with a "
+                "middle plane, mesh the true cut section as all quads, then spin."
+            ),
+            "required_checks": [
+                "cut plane passes through the intended rotation axis",
+                "accepted section shell nodes lie on the cut plane",
+                "accepted section contains only quads before spin",
+                "spin result contains hex elements only",
+                "3D vol skew <= 0.99, or report remaining failures without deleting",
             ],
         }
 
