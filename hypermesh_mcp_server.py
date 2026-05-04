@@ -93,6 +93,7 @@ A_HM_MESHING_PLAN = {
         "bearing_6903_left",
         "bearing_6903_right",
     ],
+    "cutsection_spin_hex": [],
 }
 
 A_HM_SPECIAL_WORKFLOWS = {
@@ -106,33 +107,27 @@ A_HM_SPECIAL_WORKFLOWS = {
             "mesh, spin, and save in the visible GUI."
         ),
     },
-    "bearing_6903_cutsection_spin": {
-        "script": r"F:\mcp\mesh_a_strategy_v17_cutsection_spin.tcl",
-        "input": r"F:\a_meshed_strategy_v12.hm",
-        "output": r"F:\a_meshed_strategy_v17_cutsection_spin.hm",
-        "report": r"F:\a_meshed_strategy_v17_cutsection_spin_report.txt",
-        "components": ["bearing_6903_left", "bearing_6903_right"],
+    "cutsection_spin_hex": {
+        "tool": "generate_cutsection_spin_hex_tcl",
         "method": [
-            "Start from the v12 model rather than the earlier incorrect spin attempts.",
-            "Delete only the old elements in bearing_6903_left and bearing_6903_right before replacement.",
-            "Split each bearing solid with body_splitmerge_with_plane using a middle plane.",
+            "Use this for stepped/recessed/ambiguous revolved solids where an existing face is not a trustworthy spin section.",
+            "Split the target solid with body_splitmerge_with_plane using a user-provided middle plane.",
             "Detect the real section surfaces by meshing each new surface temporarily and checking node distance to the split plane.",
             "Accept only all-quad section meshes that lie on the split plane, then spin them 360 degrees about the x axis.",
             "Delete only the temporary 2D seed shell elements after spin; keep generated 3D hex elements.",
         ],
-        "validated_result": {
-            "bearing_6903_left": "17280 hex8 elements",
-            "bearing_6903_right": "17280 hex8 elements",
-        },
-        "recorded_user_split_reference": {
-            "command_file": r"C:\Users\qcyti\Documents\command1.tcl",
-            "right_solid_command": (
-                "*createmark solids 1 23; "
-                "*createplane 1 0 -0.831039379 -0.556213583 "
-                "-55.8785515 8.02783775 1035.87476; "
-                "*body_splitmerge_with_plane solids 1 1"
-            ),
-        },
+        "required_inputs": [
+            "solid_id",
+            "component_name",
+            "split plane normal and point",
+            "spin axis and axis point",
+            "element size and spin density",
+        ],
+        "why": (
+            "Direct surface-id spin is only safe when the selected surface is a "
+            "true cross-section. For recessed or stepped rings, a real solid "
+            "split is the reliable way to obtain that cross-section."
+        ),
     },
     "quality_policy": {
         "repair_script": r"F:\mcp\repair_v12_bad_vol.tcl",
@@ -400,7 +395,7 @@ def get_a_hm_meshing_plan() -> dict[str, Any]:
         "notes": [
             "cutout_body and main_flange are treated as flange/complex tetra parts, not drag parts.",
             "drag_hex_guarded entries still require 100% quad source-face verification before drag.",
-            "bearing_6903_left and bearing_6903_right must use the real cut-section spin workflow, not a guessed section.",
+            "For stepped or recessed revolved solids, use the generic cut-section spin workflow rather than guessed surface-id spin.",
             "quality cleanup should prefer strategy changes and local repair; do not blindly refine or delete unfixable bad elements.",
             "visible GUI mode changes where the Tcl runs; meshing logic and input/output paths remain explicit.",
         ],
@@ -408,11 +403,11 @@ def get_a_hm_meshing_plan() -> dict[str, Any]:
 
 
 @mcp.tool()
-def get_a_hm_cutsection_spin_workflow() -> dict[str, Any]:
-    """Return the validated cut-section spin workflow for F:\\a.hm bearing_6903 solids."""
+def get_cutsection_spin_workflow() -> dict[str, Any]:
+    """Return the generic cut-section spin workflow for stepped/recessed revolved solids."""
     return {
         "success": True,
-        "workflow": A_HM_SPECIAL_WORKFLOWS["bearing_6903_cutsection_spin"],
+        "workflow": A_HM_SPECIAL_WORKFLOWS["cutsection_spin_hex"],
         "gui_mode": A_HM_SPECIAL_WORKFLOWS["visible_gui_mode"],
         "quality_policy": A_HM_SPECIAL_WORKFLOWS["quality_policy"],
     }
@@ -936,7 +931,188 @@ def generate_guarded_spin_hex_tcl(
         "strategy": (
             "Use spin for clean revolved bodies when the source section can be "
             "meshed as 100% quads. Fall back to tetra for flanges, protrusions, "
-            "or any non-quad section."
+            "or any non-quad section. If the selected surface is not a true "
+            "cross-section of the solid, use generate_cutsection_spin_hex_tcl."
+        ),
+    }
+
+
+@mcp.tool()
+def generate_cutsection_spin_hex_tcl(
+    solid_id: int,
+    component_name: str,
+    split_plane_normal: list[float],
+    split_plane_point: list[float],
+    spin_axis: str = "x",
+    spin_axis_point: list[float] | None = None,
+    element_size: float = 0.7,
+    density: int = 96,
+    plane_tolerance: float = 0.02,
+    delete_existing_component_elements: bool = True,
+    output_hm_path: str | None = None,
+) -> dict[str, Any]:
+    """Generate generic real cut-section spin-hex Tcl for a stepped/recessed revolved solid."""
+    if solid_id <= 0:
+        raise ValueError("solid_id must be greater than 0.")
+    if element_size <= 0:
+        raise ValueError("element_size must be greater than 0.")
+    if density <= 0:
+        raise ValueError("density must be greater than 0.")
+    if plane_tolerance <= 0:
+        raise ValueError("plane_tolerance must be greater than 0.")
+    if not component_name.strip():
+        raise ValueError("component_name cannot be empty.")
+    if len(split_plane_normal) != 3 or len(split_plane_point) != 3:
+        raise ValueError("split_plane_normal and split_plane_point must contain 3 numbers.")
+
+    axis_key = spin_axis.strip().lower()
+    axis_normals = {"x": (1, 0, 0), "y": (0, 1, 0), "z": (0, 0, 1)}
+    if axis_key not in axis_normals:
+        raise ValueError("spin_axis must be one of: x, y, z.")
+
+    nx, ny, nz = [float(v) for v in split_plane_normal]
+    px, py, pz = [float(v) for v in split_plane_point]
+    if spin_axis_point is None:
+        ax, ay, az = px, py, pz
+    else:
+        if len(spin_axis_point) != 3:
+            raise ValueError("spin_axis_point must contain 3 numbers.")
+        ax, ay, az = [float(v) for v in spin_axis_point]
+    snx, sny, snz = axis_normals[axis_key]
+    comp = component_name.replace('"', '\\"')
+
+    delete_existing = "1" if delete_existing_component_elements else "0"
+    lines = [
+        "# HyperMesh MCP generated cut-section spin-hex script",
+        "# Use for stepped/recessed revolved solids where an existing face is not a reliable section.",
+        f'set target_component "{comp}"',
+        f"set target_solid {int(solid_id)}",
+        f"set elem_size {float(element_size)}",
+        f"set spin_density {int(density)}",
+        f"set plane_tol {float(plane_tolerance)}",
+        f"set delete_existing_component_elements {delete_existing}",
+        f"set split_nx {nx}",
+        f"set split_ny {ny}",
+        f"set split_nz {nz}",
+        f"set split_px {px}",
+        f"set split_py {py}",
+        f"set split_pz {pz}",
+        f"set axis_px {ax}",
+        f"set axis_py {ay}",
+        f"set axis_pz {az}",
+        "proc mcp_mark_count {entity mark_id} {",
+        "    if {[catch {hm_marklength $entity $mark_id} n]} {return 0}",
+        "    return $n",
+        "}",
+        "proc mcp_all_surfs {} {",
+        '    *createmark surfs 1 "all"',
+        "    return [hm_getmark surfs 1]",
+        "}",
+        "proc mcp_all_elems {} {",
+        '    *createmark elems 1 "all"',
+        "    return [hm_getmark elems 1]",
+        "}",
+        "proc mcp_list_subtract {a b} {",
+        "    array set seen {}",
+        "    foreach x $b {set seen($x) 1}",
+        "    set out {}",
+        "    foreach x $a {if {![info exists seen($x)]} {lappend out $x}}",
+        "    return $out",
+        "}",
+        "proc mcp_delete_elems {elems} {",
+        "    if {[llength $elems] == 0} {return}",
+        "    eval *createmark elems 1 $elems",
+        "    catch {*deletemark elems 1}",
+        "}",
+        "proc mcp_node_plane_dist {nid nx ny nz px py pz} {",
+        "    set x [hm_getvalue nodes id=$nid dataname=x]",
+        "    set y [hm_getvalue nodes id=$nid dataname=y]",
+        "    set z [hm_getvalue nodes id=$nid dataname=z]",
+        "    set d [expr {$nx * ($x - $px) + $ny * ($y - $py) + $nz * ($z - $pz)}]",
+        "    if {$d < 0} {set d [expr {-$d}]}",
+        "    return $d",
+        "}",
+        "proc mcp_mesh_true_section {sid elem_size nx ny nz px py pz plane_tol} {",
+        "    *createmark surfaces 1 $sid",
+        "    catch {*setedgedensitylinkwithaspectratio -1}",
+        "    *setedgedensitylink 1",
+        "    *interactiveremeshsurf 1 $elem_size 1 1 2 1 1",
+        "    *set_meshfaceparams 0 5 1 0 0 1 0.5 1 1",
+        "    *automesh 0 5 1",
+        "    *storemeshtodatabase 1",
+        "    *ameshclearsurface",
+        '    *createmark elems 1 "by surface" $sid',
+        "    set shells [hm_getmark elems 1]",
+        "    if {[llength $shells] == 0} {return {}}",
+        "    set quads 0",
+        "    set maxdist 0.0",
+        "    foreach eid $shells {",
+        "        set cfg [hm_getvalue elems id=$eid dataname=config]",
+        "        if {$cfg == 104 || $cfg == 108} {incr quads}",
+        "        foreach nid [hm_getvalue elems id=$eid dataname=nodes] {",
+        "            set d [mcp_node_plane_dist $nid $nx $ny $nz $px $py $pz]",
+        "            if {$d > $maxdist} {set maxdist $d}",
+        "        }",
+        "    }",
+        "    if {$quads != [llength $shells] || $maxdist > $plane_tol} {",
+        "        mcp_delete_elems $shells",
+        "        return {}",
+        "    }",
+        "    return $shells",
+        "}",
+        'catch {*beginhistorystate "MCP cut-section spin hex"}',
+        '*currentcollector components "$target_component"',
+        "if {$delete_existing_component_elements} {",
+        '    *createmark elems 1 "by comp name" $target_component',
+        "    if {[mcp_mark_count elems 1] > 0} {catch {*deletemark elems 1}}",
+        "}",
+        "set before_surfs [mcp_all_surfs]",
+        "*createmark solids 1 $target_solid",
+        "if {[mcp_mark_count solids 1] == 0} {",
+        '    puts "MCP cut-section spin skipped: solid is missing."',
+        "} else {",
+        "    *createplane 1 $split_nx $split_ny $split_nz $split_px $split_py $split_pz",
+        "    if {[catch {*body_splitmerge_with_plane solids 1 1} split_err]} {",
+        '        puts "MCP cut-section split failed: $split_err"',
+        "    } else {",
+        "        set new_surfs [lsort -integer [mcp_list_subtract [mcp_all_surfs] $before_surfs]]",
+        '        puts "MCP cut-section new_surfs=$new_surfs"',
+        "        set seed_shells {}",
+        "        foreach sid $new_surfs {",
+        "            set shells [mcp_mesh_true_section $sid $elem_size $split_nx $split_ny $split_nz $split_px $split_py $split_pz $plane_tol]",
+        "            foreach e $shells {lappend seed_shells $e}",
+        "        }",
+        "        if {[llength $seed_shells] == 0} {",
+        '            puts "MCP cut-section spin skipped: no true all-quad section surfaces were found."',
+        "        } else {",
+        "            set before_elems [mcp_all_elems]",
+        "            eval *createmark elems 1 $seed_shells",
+        f"            *createplane 1 {snx} {sny} {snz} $axis_px $axis_py $axis_pz",
+        "            if {[catch {*meshspinelements2 1 1 360 $spin_density 1 0.0 0} spin_err]} {",
+        '                puts "MCP cut-section spin failed: $spin_err"',
+        "            } else {",
+        "                set new_elems [mcp_list_subtract [mcp_all_elems] $before_elems]",
+        "                if {[llength $new_elems] > 0} {",
+        "                    eval *createmark elems 1 $new_elems",
+        "                    catch {*movemark elems 1 $target_component}",
+        "                }",
+        "            }",
+        "            mcp_delete_elems $seed_shells",
+        "        }",
+        "    }",
+        "}",
+        'catch {*endhistorystate "MCP cut-section spin hex"}',
+    ]
+    if output_hm_path:
+        lines.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
+
+    return {
+        "success": True,
+        "script": "\n".join(lines) + "\n",
+        "strategy": (
+            "Generic cut-section spin: split the actual solid first, accept only "
+            "new all-quad surfaces that lie on that cut plane, then spin those "
+            "2D shells. This is intended for stepped/recessed revolved solids."
         ),
     }
 

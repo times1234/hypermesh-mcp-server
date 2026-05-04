@@ -51,6 +51,14 @@ F:\a_meshed_strategy_v17_cutsection_spin.hm
 F:\a_meshed_strategy_v17_cutsection_spin_report.txt
 ```
 
+`F:\a_meshed_strategy_v12.hm` is only an intermediate base model. It still may
+contain the old generic guessed-section spin result for the 6903 bearings. The
+final model for inspection must be:
+
+```text
+F:\a_meshed_strategy_v17_cutsection_spin.hm
+```
+
 Validated result:
 
 ```text
@@ -75,8 +83,11 @@ Key command:
 *body_splitmerge_with_plane solids 1 1
 ```
 
-This is the model-approved way to obtain the spin section: the section must come
-from a real solid split.
+This is the model-approved example of the more general rule: for stepped,
+recessed, or otherwise ambiguous revolved solids, the spin section must come
+from a real solid split. The generic MCP tool for this pattern is now
+`generate_cutsection_spin_hex_tcl`. `generate_guarded_spin_hex_tcl` remains for
+cases where the selected surface is already known to be a true cross-section.
 
 ## Quality policy
 
@@ -98,4 +109,3 @@ The updated repair script is:
 ```text
 F:\mcp\repair_v12_bad_vol.tcl
 ```
-
