@@ -1,0 +1,26 @@
+# Generated runtime state
+runs/
+__pycache__/
+*.py[cod]
+
+# HyperMesh model/results are local/proprietary artifacts
+*.hm
+*.h3d
+*.fem
+*.nas
+*.op2
+*.odb
+
+# User-recorded command history can be large and model-specific
+command1.tcl
+
+# Unrelated local downloads/tools in this folder
+CC-desktop-zh-cn-WIN-portable/
+claude-code-zh-cn-main/
+claude-code-zh-cn-main.tar.gz
+
+# Local logs/temp
+*.log
+*.tmp
+*.bak
+

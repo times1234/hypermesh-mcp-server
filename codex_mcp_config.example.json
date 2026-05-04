@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "hypermesh": {
+      "command": "python",
+      "args": ["F:\\mcp\\hypermesh_mcp_server.py"],
+      "env": {
+        "HYPERMESH_BATCH_EXE": "F:\\Program Files\\Altair\\2020\\hwdesktop\\hw\\bin\\win64\\hmbatch.exe",
+        "HYPERMESH_GUI_EXE": "F:\\Program Files\\Altair\\2020\\hwdesktop\\hw\\bin\\win64\\hw.exe"
+      }
+    }
+  }
+}
