@@ -46,9 +46,12 @@ mixing probe execution with final-mesh guards.
 - `generate_surface_deviation_rtrias_tcl`: generate surface deviation + R-trias Tcl.
 - `generate_gear_aware_tetra_tcl`: generate gear/tooth local-refinement tetra Tcl.
 - `generate_guarded_drag_hex_tcl`: generate guarded drag-hex Tcl.
+- `run_guarded_drag_hex_gui`: generate and execute guarded drag-hex in the visible GUI.
 - `generate_guarded_spin_hex_tcl`: generate guarded spin-hex Tcl for a known true section.
+- `run_guarded_spin_hex_gui`: generate and execute guarded spin-hex in the visible GUI.
 - `get_cutsection_spin_workflow`: explain the generic cut-section spin workflow.
 - `generate_cutsection_spin_hex_tcl`: generate cut-section spin Tcl for stepped or recessed revolved solids.
+- `run_cutsection_spin_hex_gui`: generate and execute cut-section spin-hex in the visible GUI.
 
 ## Generic Strategy Rules
 
@@ -91,7 +94,7 @@ not enough or CAD-only Tcl geometry queries return empty values. The probe:
 
 - meshes each target solid's surfaces with a coarse temporary 2D mesh
 - reads bbox and simple size/complexity data from the temporary elements
-- prints parseable `MCP_PROBE_SOLID` lines
+- prints parseable `MCP_PROBE_SOLID` and `MCP_PROBE_SURFACE` lines
 - returns the same `MCP_PROBE_*` lines through the GUI listener socket response
 - deletes the temporary probe elements and nodes before finishing
 
@@ -106,6 +109,11 @@ probe script and return `probe_lines`, so they do not go through the same
 final-mesh safety gate as raw Tcl. If `generate_geometry_probe_tcl` output is
 sent through `execute_tcl_gui`, keep the generated MCP probe comments and
 `MCP_PROBE_*` lines intact.
+
+For drag source selection on pure CAD, use `MCP_PROBE_SURFACE` lines as the
+source-face candidate table. Choose a likely planar end face whose `flat_axis`
+matches the drag axis and whose center coordinate is at the min or max end of
+the target solid. Do not guess a source surface id from component names.
 
 ### Tetra
 
@@ -156,8 +164,8 @@ largest outer count.
 
 Do not write naked Tcl with `*set_meshedgeparams` and `*meshdragelements*` for
 drag workflows. The execution tools block that path by default. Use
-`generate_guarded_drag_hex_tcl`; otherwise the balanced seed policy cannot be
-applied.
+`generate_guarded_drag_hex_tcl` or `run_guarded_drag_hex_gui`; otherwise the
+balanced seed policy cannot be applied.
 
 ### Spin Hex
 
@@ -174,8 +182,16 @@ Pass `solid_id` when possible so the generated mesh can be checked against the
 target solid. Failed fit/non-hex results are cleaned, retried once with the same
 element size, then sent to tetra fallback when enabled.
 
+For pure CAD solids where HyperMesh cannot return a solid bbox, generated hex
+workflows do not fail only because the fit bbox is unavailable. They keep valid
+all-hex results and print that the mesh-solid fit check was skipped.
+
 If the solid is stepped, recessed, grooved, or the source section is ambiguous,
 use cut-section spin instead.
+
+In visible GUI mode, prefer `run_guarded_spin_hex_gui` over generating Tcl and
+sending it through raw `execute_tcl_gui`. The runner executes the trusted
+MCP-generated workflow directly, including its guarded tetra fallback.
 
 ### Cut-Section Spin Hex
 
@@ -190,6 +206,10 @@ Workflow:
 4. Accept only all-quad surfaces whose shell nodes lie on the split plane.
 5. Spin the accepted 2D section shells into 3D hex elements.
 6. Delete only the temporary 2D seed shells.
+
+In visible GUI mode, prefer `run_cutsection_spin_hex_gui` over generating Tcl
+and sending it through raw `execute_tcl_gui`. The runner executes the trusted
+MCP-generated workflow directly, including its guarded tetra fallback.
 
 Required inputs:
 

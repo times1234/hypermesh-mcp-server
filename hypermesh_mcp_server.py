@@ -378,8 +378,11 @@ def _meshing_rule_violation(script: str) -> dict[str, Any] | None:
 
     allowed_markers = (
         "mcp guarded drag hex",
+        "mcp generated guarded drag-hex",
         "mcp guarded spin hex",
+        "mcp generated guarded spin-hex",
         "mcp cut-section spin hex",
+        "mcp generated cut-section spin-hex",
         "mcp gear-aware tetra",
         "mcp surface deviation r-trias",
         "mcp surface automesh",
@@ -537,8 +540,60 @@ def _extract_probe_lines(text: str) -> list[str]:
     return [
         line.strip()
         for line in text.splitlines()
-        if line.strip().startswith(("MCP_PROBE_BEGIN", "MCP_PROBE_SOLID", "MCP_PROBE_END"))
+        if line.strip().startswith(
+            ("MCP_PROBE_BEGIN", "MCP_PROBE_SOLID", "MCP_PROBE_SURFACE", "MCP_PROBE_END")
+        )
     ]
+
+
+def _execute_generated_gui_script(
+    *,
+    script: str,
+    host: str = "127.0.0.1",
+    port: int = DEFAULT_GUI_PORT,
+    model_path: str | None = None,
+    output_hm_path: str | None = None,
+    timeout_seconds: int = 120,
+    strategy: str,
+) -> dict[str, Any]:
+    """Execute trusted MCP-generated Tcl in the visible GUI listener."""
+    prefix: list[str] = []
+    model = _normalize_path(model_path)
+    if model:
+        if not model.exists():
+            raise FileNotFoundError(f"Model file was not found: {model}")
+        prefix.append(f'*readfile "{_quote_tcl_path(model)}"')
+
+    suffix: list[str] = []
+    if output_hm_path:
+        suffix.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
+
+    gui_script = "\n".join(prefix + [script] + suffix)
+    if not gui_script.endswith("\n"):
+        gui_script += "\n"
+
+    try:
+        result = _run_hypermesh_gui_script(
+            script=gui_script,
+            host=host,
+            port=port,
+            timeout_seconds=timeout_seconds,
+        )
+    except OSError as exc:
+        return {
+            "success": False,
+            "host": host,
+            "port": int(port),
+            "message": (
+                "Could not connect to the visible HyperMesh GUI listener. "
+                "Open HyperMesh and source the Tcl file returned by create_gui_listener_tcl."
+            ),
+            "error": str(exc),
+        }
+
+    result["script"] = script
+    result["strategy"] = strategy
+    return result
 
 
 def _run_hmbatch(
@@ -612,6 +667,8 @@ def get_meshing_rules() -> dict[str, Any]:
         "notes": [
             "First try visual/GUI or screenshot-based geometry judgment. If it is enough, do not run the geometry probe.",
             "If visual judgment is uncertain or pure CAD Tcl geometry queries return no usable bbox/type/size data, run one generate_geometry_probe_tcl script for all relevant solids, then classify from the probe output.",
+            "For visible GUI hex meshing, prefer run_guarded_drag_hex_gui, run_guarded_spin_hex_gui, or run_cutsection_spin_hex_gui instead of sending generated hex Tcl through raw execute_tcl_gui.",
+            "For pure CAD drag source selection, use MCP_PROBE_SURFACE lines from the geometry probe to choose a planar end-face candidate by geometry.",
             "Do not decide tetra/drag/spin by component name.",
             "Classify by geometry: holes/flanges/bosses/cutouts -> tetra; simple constant extrusions with matched quad source face -> drag; clean true cross-section revolved bodies -> spin.",
             "For stepped or recessed revolved solids, use the generic cut-section spin workflow rather than guessed surface-id spin.",
@@ -1172,6 +1229,13 @@ def generate_geometry_probe_tcl(
         "    foreach x $a {if {![info exists seen($x)]} {lappend out $x}}",
         "    return $out",
         "}",
+        "proc mcp_list_intersect {a b} {",
+        "    array set seen {}",
+        "    foreach x $b {set seen($x) 1}",
+        "    set out {}",
+        "    foreach x $a {if {[info exists seen($x)]} {lappend out $x}}",
+        "    return $out",
+        "}",
         "proc mcp_delete_elems {elems} {",
         "    if {[llength $elems] == 0} {return}",
         "    eval *createmark elems 1 $elems",
@@ -1223,6 +1287,36 @@ def generate_geometry_probe_tcl(
         "    if {$diag > 0} {set complexity [expr {$elem_count / max(1.0, ($diag / $probe_size) * ($diag / $probe_size))}]}",
         "    mcp_probe_line \"MCP_PROBE_SOLID id=$sid surf_count=$surf_count elem_count=$elem_count node_count=$node_count tri_count=$tri_count quad_count=$quad_count other_count=$other_count bbox_ok=$bbox_ok dx=$dx dy=$dy dz=$dz diag=$diag slender=$slender complexity=$complexity bbox={$bbox}\"",
         "}",
+        "proc mcp_probe_surface_emit {solid_id surf_id new_elems probe_size} {",
+        "    *createmark elems 3 \"by surface\" $surf_id",
+        "    set surf_elems [mcp_list_intersect [hm_getmark elems 3] $new_elems]",
+        "    set elem_count [llength $surf_elems]",
+        "    if {$elem_count == 0} {",
+        "        mcp_probe_line \"MCP_PROBE_SURFACE solid_id=$solid_id surface_id=$surf_id elem_count=0 bbox_ok=0\"",
+        "        return",
+        "    }",
+        "    eval *createmark elems 3 $surf_elems",
+        "    if {[catch {hm_getboundingbox elems 3 0 0 0} bb]} {",
+        "        mcp_probe_line \"MCP_PROBE_SURFACE solid_id=$solid_id surface_id=$surf_id elem_count=$elem_count bbox_ok=0\"",
+        "        return",
+        "    }",
+        "    set dx [expr {abs([lindex $bb 3] - [lindex $bb 0])}]",
+        "    set dy [expr {abs([lindex $bb 4] - [lindex $bb 1])}]",
+        "    set dz [expr {abs([lindex $bb 5] - [lindex $bb 2])}]",
+        "    set cx [expr {([lindex $bb 0] + [lindex $bb 3]) / 2.0}]",
+        "    set cy [expr {([lindex $bb 1] + [lindex $bb 4]) / 2.0}]",
+        "    set cz [expr {([lindex $bb 2] + [lindex $bb 5]) / 2.0}]",
+        "    set diag [expr {sqrt($dx*$dx + $dy*$dy + $dz*$dz)}]",
+        "    set spans [list $dx $dy $dz]",
+        "    set min_span $dx",
+        "    set flat_axis x",
+        "    if {$dy < $min_span} {set min_span $dy; set flat_axis y}",
+        "    if {$dz < $min_span} {set min_span $dz; set flat_axis z}",
+        "    set flat_ratio 1.0",
+        "    if {$diag > 0} {set flat_ratio [expr {$min_span / $diag}]}",
+        "    set likely_planar [expr {$flat_ratio <= 0.08 || $min_span <= $probe_size * 0.75}]",
+        "    mcp_probe_line \"MCP_PROBE_SURFACE solid_id=$solid_id surface_id=$surf_id elem_count=$elem_count bbox_ok=1 dx=$dx dy=$dy dz=$dz cx=$cx cy=$cy cz=$cz diag=$diag flat_axis=$flat_axis flat_ratio=$flat_ratio likely_planar=$likely_planar bbox={$bb}\"",
+        "}",
         'catch {*beginhistorystate "MCP geometry probe"}',
         *solid_setup,
         'mcp_probe_line "MCP_PROBE_BEGIN solid_count=[llength $target_solids] probe_size=$probe_size"',
@@ -1233,6 +1327,7 @@ def generate_geometry_probe_tcl(
         "        continue",
         "    }",
         "    *createmark surfs 1 \"by solids\" $sid",
+        "    set solid_surfs [hm_getmark surfs 1]",
         "    set surf_count [mcp_mark_count surfs 1]",
         "    if {$surf_count == 0} {",
         '        mcp_probe_line "MCP_PROBE_SOLID id=$sid surf_count=0 elem_count=0 bbox_ok=0"',
@@ -1248,6 +1343,7 @@ def generate_geometry_probe_tcl(
         "    set new_elems [mcp_list_subtract [mcp_all_elems] $before_elems]",
         "    set new_nodes [mcp_list_subtract [mcp_all_nodes] $before_nodes]",
         "    mcp_probe_emit $sid $surf_count $new_elems $probe_size",
+        "    foreach probe_surf $solid_surfs {mcp_probe_surface_emit $sid $probe_surf $new_elems $probe_size}",
         "    mcp_delete_elems $new_elems",
         "    mcp_delete_nodes $new_nodes",
         "}",
@@ -1813,7 +1909,10 @@ def generate_guarded_drag_hex_tcl(
         "    eval *createmark elems 2 $elems",
         "    *createmark solids 2 $solid_id",
         "    if {[catch {hm_getboundingbox elems 2 0 0 0} ebb]} {return 0}",
-        "    if {[catch {hm_getboundingbox solids 2 0 0 0} sbb]} {return 0}",
+        "    if {[catch {hm_getboundingbox solids 2 0 0 0} sbb] || [llength $sbb] < 6} {",
+        '        puts "MCP mesh-solid fit skipped: solid bbox unavailable for pure CAD solid=$solid_id."',
+        "        return 1",
+        "    }",
         "    set sx [expr {abs([lindex $sbb 3] - [lindex $sbb 0])}]",
         "    set sy [expr {abs([lindex $sbb 4] - [lindex $sbb 1])}]",
         "    set sz [expr {abs([lindex $sbb 5] - [lindex $sbb 2])}]",
@@ -1998,7 +2097,10 @@ def generate_guarded_spin_hex_tcl(
         "    eval *createmark elems 2 $elems",
         "    *createmark solids 2 $solid_id",
         "    if {[catch {hm_getboundingbox elems 2 0 0 0} ebb]} {return 0}",
-        "    if {[catch {hm_getboundingbox solids 2 0 0 0} sbb]} {return 0}",
+        "    if {[catch {hm_getboundingbox solids 2 0 0 0} sbb] || [llength $sbb] < 6} {",
+        '        puts "MCP mesh-solid fit skipped: solid bbox unavailable for pure CAD solid=$solid_id."',
+        "        return 1",
+        "    }",
         "    set sx [expr {abs([lindex $sbb 3] - [lindex $sbb 0])}]",
         "    set sy [expr {abs([lindex $sbb 4] - [lindex $sbb 1])}]",
         "    set sz [expr {abs([lindex $sbb 5] - [lindex $sbb 2])}]",
@@ -2250,7 +2352,10 @@ def generate_cutsection_spin_hex_tcl(
         "    *createmark solids 2 $solid_id",
         "    if {[mcp_mark_count elems 2] == 0 || [mcp_mark_count solids 2] == 0} {return 0}",
         "    if {[catch {hm_getboundingbox elems 2 0 0 0} ebb]} {return 0}",
-        "    if {[catch {hm_getboundingbox solids 2 0 0 0} sbb]} {return 0}",
+        "    if {[catch {hm_getboundingbox solids 2 0 0 0} sbb] || [llength $sbb] < 6} {",
+        '        puts "MCP mesh-solid fit skipped: solid bbox unavailable for pure CAD solid=$solid_id."',
+        "        return 1",
+        "    }",
         "    set sx [expr {abs([lindex $sbb 3] - [lindex $sbb 0])}]",
         "    set sy [expr {abs([lindex $sbb 4] - [lindex $sbb 1])}]",
         "    set sz [expr {abs([lindex $sbb 5] - [lindex $sbb 2])}]",
@@ -2434,6 +2539,161 @@ def generate_cutsection_spin_hex_tcl(
             "2D shells. This is intended for stepped/recessed revolved solids."
         ),
     }
+
+
+@mcp.tool()
+def run_guarded_drag_hex_gui(
+    source_surface_id: int,
+    drag_distance: float,
+    element_size: float,
+    component_name: str,
+    axis: str = "z",
+    solid_id: int | None = None,
+    fit_tolerance_ratio: float = 0.05,
+    retry_count: int = 1,
+    fallback_to_tetra: bool = True,
+    layer_count: int | None = None,
+    matched_edge_groups: list[list[int]] | None = None,
+    target_density: int | None = None,
+    preview_edge_seed_counts: list[int] | None = None,
+    source_edge_lengths: list[float] | None = None,
+    seed_balance_ratio_threshold: float = 1.6,
+    host: str = "127.0.0.1",
+    port: int = DEFAULT_GUI_PORT,
+    model_path: str | None = None,
+    output_hm_path: str | None = None,
+    timeout_seconds: int = 180,
+) -> dict[str, Any]:
+    """Generate and execute guarded drag-hex Tcl directly in the visible GUI."""
+    generated = generate_guarded_drag_hex_tcl(
+        source_surface_id=source_surface_id,
+        drag_distance=drag_distance,
+        element_size=element_size,
+        component_name=component_name,
+        axis=axis,
+        solid_id=solid_id,
+        fit_tolerance_ratio=fit_tolerance_ratio,
+        retry_count=retry_count,
+        fallback_to_tetra=fallback_to_tetra,
+        layer_count=layer_count,
+        matched_edge_groups=matched_edge_groups,
+        target_density=target_density,
+        preview_edge_seed_counts=preview_edge_seed_counts,
+        source_edge_lengths=source_edge_lengths,
+        seed_balance_ratio_threshold=seed_balance_ratio_threshold,
+    )
+    return _execute_generated_gui_script(
+        script=generated["script"],
+        host=host,
+        port=port,
+        model_path=model_path,
+        output_hm_path=output_hm_path,
+        timeout_seconds=timeout_seconds,
+        strategy=(
+            "Trusted MCP guarded drag-hex GUI runner. It may contain fallback "
+            "tetra commands, but only inside the generated guarded workflow."
+        ),
+    )
+
+
+@mcp.tool()
+def run_guarded_spin_hex_gui(
+    source_surface_id: int,
+    element_size: float,
+    component_name: str,
+    axis: str = "z",
+    solid_id: int | None = None,
+    fit_tolerance_ratio: float = 0.05,
+    retry_count: int = 1,
+    fallback_to_tetra: bool = True,
+    angle_degrees: float = 360.0,
+    density: int = 96,
+    host: str = "127.0.0.1",
+    port: int = DEFAULT_GUI_PORT,
+    model_path: str | None = None,
+    output_hm_path: str | None = None,
+    timeout_seconds: int = 180,
+) -> dict[str, Any]:
+    """Generate and execute guarded spin-hex Tcl directly in the visible GUI."""
+    generated = generate_guarded_spin_hex_tcl(
+        source_surface_id=source_surface_id,
+        element_size=element_size,
+        component_name=component_name,
+        axis=axis,
+        solid_id=solid_id,
+        fit_tolerance_ratio=fit_tolerance_ratio,
+        retry_count=retry_count,
+        fallback_to_tetra=fallback_to_tetra,
+        angle_degrees=angle_degrees,
+        density=density,
+    )
+    return _execute_generated_gui_script(
+        script=generated["script"],
+        host=host,
+        port=port,
+        model_path=model_path,
+        output_hm_path=output_hm_path,
+        timeout_seconds=timeout_seconds,
+        strategy=(
+            "Trusted MCP guarded spin-hex GUI runner. It may contain fallback "
+            "tetra commands, but only inside the generated guarded workflow."
+        ),
+    )
+
+
+@mcp.tool()
+def run_cutsection_spin_hex_gui(
+    solid_id: int,
+    component_name: str,
+    split_plane_normal: list[float],
+    split_plane_point: list[float],
+    spin_axis: str = "x",
+    spin_axis_point: list[float] | None = None,
+    element_size: float = 0.7,
+    density: int = 96,
+    plane_tolerance: float = 0.02,
+    fit_tolerance_ratio: float = 0.05,
+    retry_count: int = 1,
+    include_existing_section_surfaces: bool = True,
+    allow_quad_only_fallback: bool = True,
+    delete_existing_component_elements: bool = True,
+    fallback_to_tetra: bool = True,
+    host: str = "127.0.0.1",
+    port: int = DEFAULT_GUI_PORT,
+    model_path: str | None = None,
+    output_hm_path: str | None = None,
+    timeout_seconds: int = 240,
+) -> dict[str, Any]:
+    """Generate and execute cut-section spin-hex Tcl directly in the visible GUI."""
+    generated = generate_cutsection_spin_hex_tcl(
+        solid_id=solid_id,
+        component_name=component_name,
+        split_plane_normal=split_plane_normal,
+        split_plane_point=split_plane_point,
+        spin_axis=spin_axis,
+        spin_axis_point=spin_axis_point,
+        element_size=element_size,
+        density=density,
+        plane_tolerance=plane_tolerance,
+        fit_tolerance_ratio=fit_tolerance_ratio,
+        retry_count=retry_count,
+        include_existing_section_surfaces=include_existing_section_surfaces,
+        allow_quad_only_fallback=allow_quad_only_fallback,
+        delete_existing_component_elements=delete_existing_component_elements,
+        fallback_to_tetra=fallback_to_tetra,
+    )
+    return _execute_generated_gui_script(
+        script=generated["script"],
+        host=host,
+        port=port,
+        model_path=model_path,
+        output_hm_path=output_hm_path,
+        timeout_seconds=timeout_seconds,
+        strategy=(
+            "Trusted MCP cut-section spin-hex GUI runner. It may contain fallback "
+            "tetra commands, but only inside the generated guarded workflow."
+        ),
+    )
 
 
 @mcp.tool()
