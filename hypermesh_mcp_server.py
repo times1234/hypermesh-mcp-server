@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 import socket
@@ -29,9 +29,11 @@ HyperMesh meshing strategy for this workstation:
    mesh type R-trias.
 3. Tetra-volume parts must be meshed per object/component. Do not dump tetra
    elements from several objects into another component.
-4. Flanges are tetra parts, not drag parts. A flange with bolt holes, stepped
-   lips, bosses, or local cutouts must use surface-deviation R-trias followed
-   by tetramesh, even if part of its outline looks circular.
+4. Flanges are tetra parts, not drag parts, but flange classification must come
+   from geometry, not component names. A flange-like body has mounting-face
+   geometry such as a flat annular plate plus bolt-hole pattern. An open cage,
+   bracket, bearing housing, or ribbed support with large side openings must not
+   be called a flange just because a previous name contains "flange".
 5. For tetra strategy: first make 2D surface-deviation R-trias mesh, check/fix
    2D aspect > 10, then generate volume mesh with tetramesh, then check/fix
    volume skew > 0.99.
@@ -59,7 +61,7 @@ HyperMesh meshing strategy for this workstation:
    attempt before tetra; direct surface-id spin is not enough unless the surface
    is already the true radial cross-section.
 9. Component names should describe the physical object, not the mesh type.
-   Examples: housing, shaft_ring, spacer_block_upper, support_flange.
+    Examples: housing, shaft_ring, spacer_block_upper, support_flange.
 10. Do not repair quality by blindly refining the whole mesh. Prefer strategy
     changes, local 3D smoothing/remesh, or sliver-tetra repair. If bad volume
     elements still cannot be fixed, keep them in the model and report them; do
@@ -70,12 +72,20 @@ HyperMesh meshing strategy for this workstation:
     surfaces. Do not treat smooth concentric bearing races, annular grooves, or
     cylindrical outer bands as gears. If exact tooth surface IDs are not known,
     auto-detect the outer gear band only after gear geometry evidence is present.
+12. Before meshing a model, inspect every solid/component exactly once and record
+    a strategy for each object. This is a planning step only: do not split
+    meshing into many separate HyperMesh executions. Build one combined Tcl
+    script when practical. Attempt all drag/spin/cut-section-spin hex candidates
+    first; if any hex candidate fails validation, queue it for tetra. After all
+    hex candidates are attempted, mesh the tetra queue and tetra-only objects.
+    Names are allowed only as labels/hints; strategy must be chosen from geometry
+    facts for each object.
 """
 
 GENERIC_MESHING_RULES = {
     "tetra_surface_deviation_rtrias": {
         "use_when": [
-            "flanges or flange-like bodies",
+            "true geometry flanges or flange-like bodies",
             "parts with bolt holes, local holes, bosses, protrusions, ribs, grooves, cutouts, or non-sweepable topology",
             "parts whose source face cannot be proven as 100% quads with matched edge seeds",
             "fallback for ambiguous geometry",
@@ -137,6 +147,17 @@ GENERIC_MESHING_RULES = {
             "tetra mesh the solid from the mixed-size surface shell mesh",
         ],
         "fallback": "tetra_surface_deviation_rtrias with uniform base size",
+    },
+    "inspection_required": {
+        "policy": [
+            "enumerate all solids/components before meshing",
+            "run geometry-fact classification once per object",
+            "fail planning if any expected solid/component is missing from the inspection table",
+            "do not choose strategy from component names",
+            "do not execute one HyperMesh call per object; combine generated Tcl blocks when practical",
+            "attempt drag/spin/cut-section-spin candidates before tetra",
+            "queue failed hex candidates for tetra fallback, then run tetra last",
+        ],
     },
 }
 
@@ -560,6 +581,12 @@ def classify_hypermesh_part_strategy(
     part_name: str = "",
     description: str = "",
     is_flange: bool = False,
+    is_flat_annular_mounting_plate: bool = False,
+    has_mounting_bolt_pattern: bool = False,
+    has_planar_mounting_face: bool = False,
+    has_open_cage_or_housing_geometry: bool = False,
+    has_large_side_openings: bool = False,
+    has_ribs_or_spokes: bool = False,
     has_bolt_holes: bool = False,
     has_boss_or_protrusion: bool = False,
     is_simple_straight_tube: bool = False,
@@ -584,12 +611,17 @@ def classify_hypermesh_part_strategy(
     matched_inner_outer_seed_counts: bool = False,
 ) -> dict[str, Any]:
     """Classify a part into tetra, drag-hex, or spin-hex strategy."""
-    text = f"{part_name} {description}".lower()
-    flange_words = ("flange", "法兰")
-    bolt_words = ("bolt", "hole", "孔", "螺栓", "螺孔")
-
-    looks_like_flange = is_flange or any(word in text for word in flange_words)
-    looks_like_bolted = has_bolt_holes or any(word in text for word in bolt_words)
+    looks_like_flange = (
+        is_flange
+        or (
+            is_flat_annular_mounting_plate
+            and has_planar_mounting_face
+            and (has_mounting_bolt_pattern or has_bolt_holes)
+            and not has_open_cage_or_housing_geometry
+            and not has_large_side_openings
+        )
+    )
+    looks_like_bolted = has_bolt_holes or has_mounting_bolt_pattern
     positive_gear_evidence_count = sum(
         1
         for flag in (
@@ -629,20 +661,7 @@ def classify_hypermesh_part_strategy(
     looks_like_gear = not negative_bearing_evidence and (
         geometry_gear_evidence or name_hint_indicates_gear
     )
-    stepped_tokens = (
-        "step",
-        "stepped",
-        "recess",
-        "recessed",
-        "groove",
-        "grooved",
-        "凹",
-        "台阶",
-        "槽",
-    )
-    looks_stepped_revolved = is_stepped_or_recessed_revolved or (
-        is_clean_revolved_section and any(word in text for word in stepped_tokens)
-    )
+    looks_stepped_revolved = is_stepped_or_recessed_revolved
 
     if looks_like_gear:
         return {
@@ -668,15 +687,43 @@ def classify_hypermesh_part_strategy(
             ),
         }
 
+    if has_open_cage_or_housing_geometry or has_large_side_openings or has_ribs_or_spokes:
+        return {
+            "success": True,
+            "strategy": "tetra_surface_deviation_rtrias",
+            "recommended_component_name": (
+                "open_housing" if has_open_cage_or_housing_geometry else "ribbed_support"
+            ),
+            "reason": (
+                "Open cage/housing or ribbed support geometry: classify by actual "
+                "large openings, ribs, and support faces, not by any flange-like "
+                "component name. Use per-object tetra unless a separate simple "
+                "sweepable sub-body is proven."
+            ),
+            "required_checks": [
+                "large openings/ribs are geometry evidence for housing/support, not flange naming",
+                "2D aspect <= 10 after cleanup",
+                "3D vol skew <= 0.99 after repair/report",
+                "tet elements remain in the part's own component",
+            ],
+            "name_policy": (
+                "Do not name this part flange unless true flat annular mounting "
+                "geometry is present."
+            ),
+        }
+
     if looks_like_flange or looks_like_bolted:
         return {
             "success": True,
             "strategy": "tetra_surface_deviation_rtrias",
+            "recommended_component_name": "mounting_flange" if looks_like_flange else "bolted_part",
             "reason": (
-                "Flange or bolted/holed part: use surface-deviation R-trias 2D "
-                "mesh followed by per-component tetramesh. Do not drag this part."
+                "True flange-like mounting geometry or bolt-hole pattern: use "
+                "surface-deviation R-trias 2D mesh followed by per-component "
+                "tetramesh. Do not drag this part."
             ),
             "required_checks": [
+                "flange decision comes from flat mounting/bolt geometry, not component name",
                 "2D aspect <= 10 after cleanup",
                 "3D vol skew <= 0.99 after repair",
                 "tet elements remain in the part's own component",
@@ -782,6 +829,114 @@ def classify_hypermesh_part_strategy(
             "2D aspect <= 10 after cleanup",
             "3D vol skew <= 0.99 after repair",
         ],
+    }
+
+
+@mcp.tool()
+def classify_hypermesh_model_parts(
+    expected_part_ids: list[int | str],
+    part_observations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Classify every expected solid/component and fail if any object was skipped."""
+    if not expected_part_ids:
+        raise ValueError("expected_part_ids cannot be empty.")
+
+    expected = [str(value) for value in expected_part_ids]
+    expected_set = set(expected)
+    allowed_keys = {
+        "part_name",
+        "description",
+        "is_flange",
+        "is_flat_annular_mounting_plate",
+        "has_mounting_bolt_pattern",
+        "has_planar_mounting_face",
+        "has_open_cage_or_housing_geometry",
+        "has_large_side_openings",
+        "has_ribs_or_spokes",
+        "has_bolt_holes",
+        "has_boss_or_protrusion",
+        "is_simple_straight_tube",
+        "is_constant_section_extrusion",
+        "is_clean_revolved_section",
+        "is_stepped_or_recessed_revolved",
+        "has_gear_teeth",
+        "has_helical_teeth",
+        "has_twisted_tooth_faces",
+        "has_many_repeated_radial_teeth",
+        "has_periodic_outer_radius_variation",
+        "has_outer_tooth_band",
+        "has_repeated_tooth_flanks",
+        "has_alternating_tooth_peaks_and_roots",
+        "is_smooth_concentric_ring",
+        "has_bearing_race_grooves",
+        "has_annular_grooves_only",
+        "tooth_count",
+        "outer_radius_variation_ratio",
+        "name_hint_indicates_gear",
+        "source_faces_can_be_all_quads",
+        "matched_inner_outer_seed_counts",
+    }
+
+    seen: set[str] = set()
+    duplicate_ids: list[str] = []
+    unexpected_ids: list[str] = []
+    classifications: list[dict[str, Any]] = []
+    hex_first_part_ids: list[Any] = []
+    tetra_part_ids: list[Any] = []
+
+    for observation in part_observations:
+        if "part_id" not in observation:
+            raise ValueError("Each part observation must include part_id.")
+        part_id = str(observation["part_id"])
+        if part_id in seen:
+            duplicate_ids.append(part_id)
+        seen.add(part_id)
+        if part_id not in expected_set:
+            unexpected_ids.append(part_id)
+
+        kwargs = {key: observation[key] for key in allowed_keys if key in observation}
+        result = classify_hypermesh_part_strategy(**kwargs)
+        result["part_id"] = observation["part_id"]
+        result["inspected"] = True
+        classifications.append(result)
+        if result["strategy"] in {"drag_hex", "spin_hex", "cutsection_spin_hex"}:
+            hex_first_part_ids.append(observation["part_id"])
+        else:
+            tetra_part_ids.append(observation["part_id"])
+
+    missing_ids = [part_id for part_id in expected if part_id not in seen]
+    success = not missing_ids and not duplicate_ids and not unexpected_ids
+    return {
+        "success": success,
+        "checked_count": len(seen),
+        "expected_count": len(expected),
+        "missing_part_ids": missing_ids,
+        "duplicate_part_ids": duplicate_ids,
+        "unexpected_part_ids": unexpected_ids,
+        "classifications": classifications,
+        "execution_plan": {
+            "single_gui_execution_preferred": True,
+            "phase_order": [
+                "classify_all_parts_once",
+                "build_one_combined_tcl_script",
+                "run_drag_spin_cutsection_spin_candidates_first",
+                "queue_failed_hex_candidates_for_tetra",
+                "run_tetra_for_remaining_and_failed_parts_last",
+            ],
+            "hex_first_part_ids": hex_first_part_ids,
+            "tetra_part_ids": tetra_part_ids,
+            "notes": [
+                "This tool is only a lightweight pre-meshing classification table.",
+                "Do not execute one Tcl call per object just because this table exists.",
+                "Concatenate generator-produced Tcl blocks and send one combined script to execute_tcl_gui when practical.",
+            ],
+        },
+        "policy": (
+            "Every expected solid/component must be inspected and classified from "
+            "geometry facts before meshing. Component names are labels only. "
+            "Hex-capable drag/spin/cut-section-spin candidates are attempted before "
+            "tetra; failed hex candidates are queued for tetra fallback."
+        ),
     }
 
 

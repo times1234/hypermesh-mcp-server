@@ -32,6 +32,7 @@ refinement rules.
 - `get_hypermesh_meshing_strategy`: return generic meshing rules and workflows.
 - `get_meshing_rules`: return structured generic tetra/drag/spin rules.
 - `classify_hypermesh_part_strategy`: classify a part by geometry features.
+- `classify_hypermesh_model_parts`: classify every expected solid/component and fail if any object is skipped.
 - `generate_surface_automesh_tcl`: generate simple surface automesh Tcl.
 - `generate_surface_deviation_rtrias_tcl`: generate surface deviation + R-trias Tcl.
 - `generate_gear_aware_tetra_tcl`: generate gear/tooth local-refinement tetra Tcl.
@@ -45,21 +46,33 @@ refinement rules.
 Use `classify_hypermesh_part_strategy` and geometry facts, not component names.
 The intended order is:
 
-1. Try the structured hex route that matches the geometry: drag, spin, or
-   cut-section spin.
-2. Validate that real 3D hex elements were created. A leftover 2D section mesh
-   by itself is a failure.
-3. If the hex route fails, clean up temporary/invalid elements and mesh that
-   object with tetra.
-4. For bearing/ring-like revolved bodies, do not stop after direct spin fails.
+1. Enumerate all solids/components in the model.
+2. Inspect every object once and record geometry facts for each one.
+3. Run `classify_hypermesh_model_parts` with the full expected id list as a
+   lightweight planning table. This is not a command to execute one Tcl script
+   per object.
+4. Build one combined Tcl script when practical.
+5. In that combined script, attempt all structured hex candidates first:
+   `drag`, `spin`, and `cut-section spin`.
+6. If a hex candidate fails validation, queue that object for tetra fallback.
+7. After all hex candidates have been attempted, mesh the tetra queue and all
+   tetra-only objects.
+8. For bearing/ring-like revolved bodies, do not stop after direct spin fails.
    Use a real cut plane through the rotation axis, mesh the true radial section,
    and spin that section before tetra fallback.
+
+Names are labels only. Never decide that a part is flange/gear/bearing from the
+component name alone.
+
+Performance rule: avoid splitting the workflow into many `generate_*` and
+`execute_tcl_gui` calls. Generate Tcl blocks, concatenate them, and send one
+combined script to HyperMesh whenever possible.
 
 ### Tetra
 
 Use `tetra_surface_deviation_rtrias` for:
 
-- flanges or flange-like bodies
+- true geometry flanges or flange-like bodies
 - bodies with bolt holes, local holes, bosses, protrusions, ribs, grooves, cutouts, or non-sweepable topology
 - ambiguous parts where a clean drag/spin source cannot be proven
 
@@ -69,6 +82,15 @@ Required checks:
 - clean/check 2D aspect issues
 - tetramesh per component/object
 - check and locally repair/report volume quality
+
+Flange naming policy:
+
+- A component named `flange` is not automatically a flange.
+- A true flange needs geometric evidence such as a flat annular mounting plate,
+  planar mounting face, and bolt-hole/mounting pattern.
+- Open cages, bearing housings, ribbed supports, and large side-opening bodies
+  should be named by physical role such as `open_housing`, `bearing_housing`, or
+  `ribbed_support`, not `flange`, unless true mounting-flange geometry exists.
 
 ### Drag Hex
 
