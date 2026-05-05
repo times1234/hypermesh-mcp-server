@@ -335,11 +335,48 @@ def _balanced_seed_density(
     return max(4, min(120, int(balanced))), source
 
 
+def _is_geometry_probe_script(script: str) -> bool:
+    """Return True for MCP geometry-probe scripts that create only temporary shells."""
+    lowered = script.lower()
+    has_probe_identity = any(
+        token in lowered
+        for token in (
+            "mcp geometry probe",
+            "mcp_probe_begin",
+            "mcp_probe_solid",
+            "mcp_probe_end",
+            "mcp_probe_emit",
+        )
+    )
+    if not has_probe_identity:
+        return False
+
+    has_probe_meshing = "*defaultmeshsurf_growth" in lowered or "*automesh" in lowered
+    deletes_temp_elems = "mcp_delete_elems" in lowered or "*deletemark elems" in lowered
+    deletes_temp_nodes = "mcp_delete_nodes" in lowered or "*deletemark nodes" in lowered
+    has_final_volume_meshing = any(
+        token in lowered
+        for token in (
+            "*meshdragelements",
+            "*meshspinelements",
+            "*tetmesh",
+        )
+    )
+    return (
+        has_probe_meshing
+        and deletes_temp_elems
+        and deletes_temp_nodes
+        and not has_final_volume_meshing
+    )
+
+
 def _meshing_rule_violation(script: str) -> dict[str, Any] | None:
     """Reject raw meshing Tcl that bypasses MCP strategy generators."""
     lowered = script.lower()
+    if _is_geometry_probe_script(script):
+        return None
+
     allowed_markers = (
-        "mcp geometry probe",
         "mcp guarded drag hex",
         "mcp guarded spin hex",
         "mcp cut-section spin hex",
@@ -354,6 +391,7 @@ def _meshing_rule_violation(script: str) -> dict[str, Any] | None:
     has_spin = "*meshspinelements" in lowered
     has_tetra = "*tetmesh" in lowered
     has_surface_growth = "*defaultmeshsurf_growth" in lowered
+    has_surface_automesh = "*automesh" in lowered or "*interactiveremeshsurf" in lowered
     has_direct_seed = "*set_meshedgeparams" in lowered
 
     if has_drag or has_direct_seed:
@@ -385,19 +423,25 @@ def _meshing_rule_violation(script: str) -> dict[str, Any] | None:
             ),
         }
 
-    if has_tetra or has_surface_growth:
+    if has_tetra or has_surface_growth or has_surface_automesh:
         return {
             "success": False,
             "policy_violation": True,
             "blocked_command": "tetra_or_surface_growth",
-            "required_tool": "generate_gear_aware_tetra_tcl or generate_surface_deviation_rtrias_tcl",
+            "required_tool": (
+                "generate_geometry_probe_tcl/run_geometry_probe_gui for temporary "
+                "geometry probing, or generate_gear_aware_tetra_tcl / "
+                "generate_surface_deviation_rtrias_tcl for final meshing"
+            ),
             "message": (
                 "Raw Tcl tetra/surface-growth meshing commands are blocked because "
-                "they bypass MCP geometry rules. If geometry inspection shows gear "
-                "features, use generate_gear_aware_tetra_tcl so only tooth/flank/root "
-                "or auto-detected outer gear-band faces are refined and the rest of "
-                "the object keeps the base size. For non-gear geometry, use "
-                "generate_surface_deviation_rtrias_tcl."
+                "they bypass MCP geometry rules. Temporary geometry probes are allowed "
+                "only when the script has MCP_PROBE/MCP geometry probe identity and "
+                "deletes its temporary shell elements and nodes. If geometry inspection "
+                "shows gear features, use generate_gear_aware_tetra_tcl so only "
+                "tooth/flank/root or auto-detected outer gear-band faces are refined "
+                "and the rest of the object keeps the base size. For non-gear geometry, "
+                "use generate_surface_deviation_rtrias_tcl."
             ),
         }
 
@@ -486,6 +530,15 @@ def _run_hypermesh_gui_script(
         "port": int(port),
         "response": response,
     }
+
+
+def _extract_probe_lines(text: str) -> list[str]:
+    """Extract parseable geometry-probe lines from HyperMesh stdout/GUI response."""
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip().startswith(("MCP_PROBE_BEGIN", "MCP_PROBE_SOLID", "MCP_PROBE_END"))
+    ]
 
 
 def _run_hmbatch(
@@ -1095,6 +1148,11 @@ def generate_geometry_probe_tcl(
         f"set probe_max_dev {float(max_deviation)}",
         f"set probe_feature_angle {float(max_feature_angle)}",
         f"set probe_growth {float(growth_rate)}",
+        'set ::mcp_probe_output ""',
+        "proc mcp_probe_line {line} {",
+        "    puts $line",
+        "    append ::mcp_probe_output $line \"\\n\"",
+        "}",
         "proc mcp_mark_count {entity mark_id} {",
         "    if {[catch {hm_marklength $entity $mark_id} n]} {return 0}",
         "    return $n",
@@ -1163,28 +1221,28 @@ def generate_geometry_probe_tcl(
         "    if {[lindex $dims 0] > 0} {set slender [expr {[lindex $dims 2] / [lindex $dims 0]}]}",
         "    set complexity 0.0",
         "    if {$diag > 0} {set complexity [expr {$elem_count / max(1.0, ($diag / $probe_size) * ($diag / $probe_size))}]}",
-        "    puts \"MCP_PROBE_SOLID id=$sid surf_count=$surf_count elem_count=$elem_count node_count=$node_count tri_count=$tri_count quad_count=$quad_count other_count=$other_count bbox_ok=$bbox_ok dx=$dx dy=$dy dz=$dz diag=$diag slender=$slender complexity=$complexity bbox={$bbox}\"",
+        "    mcp_probe_line \"MCP_PROBE_SOLID id=$sid surf_count=$surf_count elem_count=$elem_count node_count=$node_count tri_count=$tri_count quad_count=$quad_count other_count=$other_count bbox_ok=$bbox_ok dx=$dx dy=$dy dz=$dz diag=$diag slender=$slender complexity=$complexity bbox={$bbox}\"",
         "}",
         'catch {*beginhistorystate "MCP geometry probe"}',
         *solid_setup,
-        'puts "MCP_PROBE_BEGIN solid_count=[llength $target_solids] probe_size=$probe_size"',
+        'mcp_probe_line "MCP_PROBE_BEGIN solid_count=[llength $target_solids] probe_size=$probe_size"',
         "foreach sid $target_solids {",
         "    *createmark solids 1 $sid",
         "    if {[mcp_mark_count solids 1] == 0} {",
-        '        puts "MCP_PROBE_SOLID id=$sid missing=1"',
+        '        mcp_probe_line "MCP_PROBE_SOLID id=$sid missing=1"',
         "        continue",
         "    }",
         "    *createmark surfs 1 \"by solids\" $sid",
         "    set surf_count [mcp_mark_count surfs 1]",
         "    if {$surf_count == 0} {",
-        '        puts "MCP_PROBE_SOLID id=$sid surf_count=0 elem_count=0 bbox_ok=0"',
+        '        mcp_probe_line "MCP_PROBE_SOLID id=$sid surf_count=0 elem_count=0 bbox_ok=0"',
         "        continue",
         "    }",
         "    set before_elems [mcp_all_elems]",
         "    set before_nodes [mcp_all_nodes]",
         "    *createarray 3 0 0 0",
         "    if {[catch {*defaultmeshsurf_growth 1 $probe_size 3 3 2 1 1 1 35 0 $probe_min_size $probe_max_size $probe_max_dev $probe_feature_angle $probe_growth 1 3 1 0} mesh_err]} {",
-        '        puts "MCP_PROBE_SOLID id=$sid surf_count=$surf_count elem_count=0 bbox_ok=0 mesh_error={$mesh_err}"',
+        '        mcp_probe_line "MCP_PROBE_SOLID id=$sid surf_count=$surf_count elem_count=0 bbox_ok=0 mesh_error={$mesh_err}"',
         "        continue",
         "    }",
         "    set new_elems [mcp_list_subtract [mcp_all_elems] $before_elems]",
@@ -1193,11 +1251,12 @@ def generate_geometry_probe_tcl(
         "    mcp_delete_elems $new_elems",
         "    mcp_delete_nodes $new_nodes",
         "}",
-        'puts "MCP_PROBE_END"',
+        'mcp_probe_line "MCP_PROBE_END"',
         'catch {*endhistorystate "MCP geometry probe"}',
     ]
     if output_hm_path:
         lines.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
+    lines.append("set ::mcp_probe_output")
 
     return {
         "success": True,
@@ -1210,6 +1269,108 @@ def generate_geometry_probe_tcl(
             "temporary shell elements and nodes."
         ),
     }
+
+
+@mcp.tool()
+def run_geometry_probe_gui(
+    solid_ids: list[int] | None = None,
+    probe_element_size: float = 5.0,
+    min_element_size: float = 1.0,
+    max_deviation: float = 0.5,
+    max_feature_angle: float = 20.0,
+    growth_rate: float = 1.3,
+    host: str = "127.0.0.1",
+    port: int = DEFAULT_GUI_PORT,
+    model_path: str | None = None,
+    timeout_seconds: int = 120,
+) -> dict[str, Any]:
+    """Run the temporary geometry probe directly in the visible GUI listener."""
+    generated = generate_geometry_probe_tcl(
+        solid_ids=solid_ids,
+        probe_element_size=probe_element_size,
+        min_element_size=min_element_size,
+        max_deviation=max_deviation,
+        max_feature_angle=max_feature_angle,
+        growth_rate=growth_rate,
+    )
+    script = generated["script"]
+
+    prefix: list[str] = []
+    model = _normalize_path(model_path)
+    if model:
+        if not model.exists():
+            raise FileNotFoundError(f"Model file was not found: {model}")
+        prefix.append(f'*readfile "{_quote_tcl_path(model)}"')
+    gui_script = "\n".join(prefix + [script])
+    if not gui_script.endswith("\n"):
+        gui_script += "\n"
+
+    try:
+        result = _run_hypermesh_gui_script(
+            script=gui_script,
+            host=host,
+            port=port,
+            timeout_seconds=timeout_seconds,
+        )
+    except OSError as exc:
+        return {
+            "success": False,
+            "host": host,
+            "port": int(port),
+            "message": (
+                "Could not connect to the visible HyperMesh GUI listener. "
+                "Open HyperMesh and source the Tcl file returned by create_gui_listener_tcl."
+            ),
+            "error": str(exc),
+        }
+
+    result["probe_lines"] = _extract_probe_lines(result.get("response", ""))
+    result["script"] = script
+    result["strategy"] = (
+        "This tool intentionally bypasses final-meshing policy checks because it "
+        "runs only an MCP geometry probe: temporary coarse shells are created, "
+        "reported, and deleted before the script ends."
+    )
+    return result
+
+
+@mcp.tool()
+def run_geometry_probe(
+    input_hm_path: str,
+    solid_ids: list[int] | None = None,
+    probe_element_size: float = 5.0,
+    min_element_size: float = 1.0,
+    max_deviation: float = 0.5,
+    max_feature_angle: float = 20.0,
+    growth_rate: float = 1.3,
+    hmbatch_path: str | None = None,
+    timeout_seconds: int = 120,
+) -> dict[str, Any]:
+    """Run the temporary geometry probe in hmbatch without final-mesh policy checks."""
+    generated = generate_geometry_probe_tcl(
+        solid_ids=solid_ids,
+        probe_element_size=probe_element_size,
+        min_element_size=min_element_size,
+        max_deviation=max_deviation,
+        max_feature_angle=max_feature_angle,
+        growth_rate=growth_rate,
+    )
+    result = _run_hmbatch(
+        hmbatch_path=hmbatch_path,
+        model_path=input_hm_path,
+        script=generated["script"],
+        timeout_seconds=timeout_seconds,
+    )
+    result["probe_lines"] = _extract_probe_lines(
+        "\n".join([result.get("stdout", ""), result.get("stderr", "")])
+    )
+    result["script"] = generated["script"]
+    result["strategy"] = (
+        "This tool intentionally bypasses final-meshing policy checks because it "
+        "runs only an MCP geometry probe: temporary coarse shells are created, "
+        "reported, and deleted before the script ends."
+    )
+    return result
 
 
 @mcp.tool()

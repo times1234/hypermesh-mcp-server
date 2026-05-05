@@ -21,6 +21,12 @@ was produced by one of the MCP strategy generators. This prevents agents from
 bypassing balanced drag seeding, cut-section validation, and gear-local
 refinement rules.
 
+Geometry probes are a special case: they may create temporary coarse shell
+elements only when the script carries MCP probe identity, prints
+`MCP_PROBE_*` lines, and deletes the temporary elements and nodes. Agents can
+also call `run_geometry_probe_gui` or `run_geometry_probe` directly to avoid
+mixing probe execution with final-mesh guards.
+
 ## Main Tools
 
 - `locate_hypermesh`: find candidate HyperMesh batch and GUI executables.
@@ -34,6 +40,8 @@ refinement rules.
 - `classify_hypermesh_part_strategy`: classify a part by geometry features.
 - `classify_hypermesh_model_parts`: classify every expected solid/component and fail if any object is skipped.
 - `generate_geometry_probe_tcl`: create temporary coarse surface meshes to probe pure CAD geometry, then delete them.
+- `run_geometry_probe_gui`: execute the temporary geometry probe directly in the visible GUI listener.
+- `run_geometry_probe`: execute the temporary geometry probe in batch mode.
 - `generate_surface_automesh_tcl`: generate simple surface automesh Tcl.
 - `generate_surface_deviation_rtrias_tcl`: generate surface deviation + R-trias Tcl.
 - `generate_gear_aware_tetra_tcl`: generate gear/tooth local-refinement tetra Tcl.
@@ -84,12 +92,20 @@ not enough or CAD-only Tcl geometry queries return empty values. The probe:
 - meshes each target solid's surfaces with a coarse temporary 2D mesh
 - reads bbox and simple size/complexity data from the temporary elements
 - prints parseable `MCP_PROBE_SOLID` lines
+- returns the same `MCP_PROBE_*` lines through the GUI listener socket response
 - deletes the temporary probe elements and nodes before finishing
 
 Probe output helps infer rough geometry facts such as size ratios, coarse
 complexity, and whether a pure CAD solid can be treated as simple or complex.
 It is not a replacement for final mesh generation and should not be run per
 object when one combined probe script can cover all solids.
+
+If an agent only needs probe data, prefer `run_geometry_probe_gui` in visible
+GUI mode or `run_geometry_probe` in batch mode. These tools execute only the
+probe script and return `probe_lines`, so they do not go through the same
+final-mesh safety gate as raw Tcl. If `generate_geometry_probe_tcl` output is
+sent through `execute_tcl_gui`, keep the generated MCP probe comments and
+`MCP_PROBE_*` lines intact.
 
 ### Tetra
 
