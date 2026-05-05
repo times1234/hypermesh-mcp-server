@@ -197,8 +197,8 @@ target solid. Failed fit/non-hex results are cleaned, retried once with the same
 element size, then sent to tetra fallback when enabled.
 
 For pure CAD solids where HyperMesh cannot return a solid bbox, generated hex
-workflows do not fail only because the fit bbox is unavailable. They keep valid
-all-hex results and print that the mesh-solid fit check was skipped.
+workflows must not accept the result blindly. The guarded generators reject that
+hex candidate, clean temporary elements, and use tetra fallback when enabled.
 
 If the solid is stepped, recessed, grooved, or the source section is ambiguous,
 use cut-section spin instead.

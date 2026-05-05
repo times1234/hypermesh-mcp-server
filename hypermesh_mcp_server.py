@@ -72,14 +72,13 @@ HyperMesh meshing strategy for this workstation:
     surfaces. Do not treat smooth concentric bearing races, annular grooves, or
     cylindrical outer bands as gears. If exact tooth surface IDs are not known,
     auto-detect the outer gear band only after gear geometry evidence is present.
-12. Before meshing a model, inspect every solid/component exactly once and record
-    a strategy for each object. This is a planning step only: do not split
-    meshing into many separate HyperMesh executions. Build one combined Tcl
-    script when practical. Attempt all drag/spin/cut-section-spin hex candidates
-    first; if any hex candidate fails validation, queue it for tetra. After all
-    hex candidates are attempted, mesh the tetra queue and tetra-only objects.
-    Names are allowed only as labels/hints; strategy must be chosen from geometry
-    facts for each object.
+12. Planning is advisory, not a mandatory audit gate. When geometry is unclear,
+    classify relevant solids from visual/probe facts before meshing, but do not
+    add a slow separate review phase. Build one practical Tcl script or use a
+    GUI runner when possible. Attempt obvious drag/spin/cut-section-spin hex
+    candidates first; if a hex candidate fails validation, clean its temporary
+    elements and fall back to tetra. Names are allowed only as labels/hints;
+    strategy should come from geometry facts when available.
 """
 
 GENERIC_MESHING_RULES = {
@@ -1628,6 +1627,7 @@ def generate_batch_tetra_tcl(
     component_names: list[str] | None = None,
     component_prefix: str = "tetra_solid",
     output_hm_path: str | None = None,
+    delete_existing_component_elements: bool = True,
     min_element_size: float = 0.5,
     max_deviation: float = 0.1,
     max_feature_angle: float = 15.0,
@@ -1654,6 +1654,7 @@ def generate_batch_tetra_tcl(
         names = [str(name) if str(name).strip() else f"{component_prefix}_{int(sid)}" for name, sid in zip(component_names, solid_ids)]
     name_list = " ".join(f'"{_quote_tcl_word(name)}"' for name in names)
     max_element_size = max(float(element_size) * 1.8, float(min_element_size))
+    delete_existing = "1" if delete_existing_component_elements else "0"
     lines = [
         "# HyperMesh MCP generated batch tetra script",
         "# Meshes multiple solids in one GUI/batch execution; no per-solid execute loop is needed.",
@@ -1666,6 +1667,7 @@ def generate_batch_tetra_tcl(
         f"set max_dev {float(max_deviation)}",
         f"set feature_angle {float(max_feature_angle)}",
         f"set growth_rate {float(growth_rate)}",
+        f"set delete_existing_component_elements {delete_existing}",
         "proc mcp_all_elems {} {",
         '    *createmark elems 1 "all"',
         "    return [hm_getmark elems 1]",
@@ -1689,6 +1691,10 @@ def generate_batch_tetra_tcl(
         "proc mcp_batch_tetra_one {solid_id comp elem_size min_size max_size max_dev feature_angle growth_rate} {",
         '    puts "MCP_BATCH_TETRA_START solid=$solid_id comp=$comp"',
         "    *currentcollector components $comp",
+        "    if {$::mcp_delete_existing_component_elements} {",
+        '        *createmark elems 1 "by comp name" $comp',
+        "        if {[mcp_mark_count elems 1] > 0} {catch {*deletemark elems 1}}",
+        "    }",
         "    *createmark solids 2 $solid_id",
         "    if {[mcp_mark_count solids 2] == 0} {",
         '        puts "MCP_BATCH_TETRA_RESULT solid=$solid_id success=0 reason=missing_solid"',
@@ -1728,6 +1734,7 @@ def generate_batch_tetra_tcl(
         "}",
         "set batch_success 0",
         "set batch_failed {}",
+        "set ::mcp_delete_existing_component_elements $delete_existing_component_elements",
         "for {set i 0} {$i < [llength $batch_tetra_solids]} {incr i} {",
         "    set sid [lindex $batch_tetra_solids $i]",
         "    set comp [lindex $batch_tetra_components $i]",
@@ -1759,6 +1766,7 @@ def run_batch_tetra_gui(
     element_size: float,
     component_names: list[str] | None = None,
     component_prefix: str = "tetra_solid",
+    delete_existing_component_elements: bool = True,
     min_element_size: float = 0.5,
     max_deviation: float = 0.1,
     max_feature_angle: float = 15.0,
@@ -1775,6 +1783,7 @@ def run_batch_tetra_gui(
         element_size=element_size,
         component_names=component_names,
         component_prefix=component_prefix,
+        delete_existing_component_elements=delete_existing_component_elements,
         min_element_size=min_element_size,
         max_deviation=max_deviation,
         max_feature_angle=max_feature_angle,
@@ -2156,8 +2165,8 @@ def generate_guarded_drag_hex_tcl(
         "    *createmark solids 2 $solid_id",
         "    if {[catch {hm_getboundingbox elems 2 0 0 0} ebb]} {return 0}",
         "    if {[catch {hm_getboundingbox solids 2 0 0 0} sbb] || [llength $sbb] < 6} {",
-        '        puts "MCP mesh-solid fit skipped: solid bbox unavailable for pure CAD solid=$solid_id."',
-        "        return 1",
+        '        puts "MCP mesh-solid fit failed: solid bbox unavailable for solid=$solid_id; rejecting hex candidate."',
+        "        return 0",
         "    }",
         "    set sx [expr {abs([lindex $sbb 3] - [lindex $sbb 0])}]",
         "    set sy [expr {abs([lindex $sbb 4] - [lindex $sbb 1])}]",
@@ -2173,6 +2182,9 @@ def generate_guarded_drag_hex_tcl(
         "    if {$solid_id <= 0} {return 0}",
         '    puts "MCP fallback tetra started for solid=$solid_id comp=$comp"',
         "    *currentcollector components $comp",
+        '    *createmark elems 1 "by comp name" $comp',
+        "    if {[catch {hm_marklength elems 1} existing_count]} {set existing_count 0}",
+        "    if {$existing_count > 0} {catch {*deletemark elems 1}}",
         "    *createmark solids 2 $solid_id",
         "    *createmark surfs 1 \"by solids\" $solid_id",
         "    if {[catch {hm_marklength surfs 1} sc] || $sc == 0} {return 0}",
@@ -2344,8 +2356,8 @@ def generate_guarded_spin_hex_tcl(
         "    *createmark solids 2 $solid_id",
         "    if {[catch {hm_getboundingbox elems 2 0 0 0} ebb]} {return 0}",
         "    if {[catch {hm_getboundingbox solids 2 0 0 0} sbb] || [llength $sbb] < 6} {",
-        '        puts "MCP mesh-solid fit skipped: solid bbox unavailable for pure CAD solid=$solid_id."',
-        "        return 1",
+        '        puts "MCP mesh-solid fit failed: solid bbox unavailable for solid=$solid_id; rejecting hex candidate."',
+        "        return 0",
         "    }",
         "    set sx [expr {abs([lindex $sbb 3] - [lindex $sbb 0])}]",
         "    set sy [expr {abs([lindex $sbb 4] - [lindex $sbb 1])}]",
@@ -2361,6 +2373,9 @@ def generate_guarded_spin_hex_tcl(
         "    if {$solid_id <= 0} {return 0}",
         '    puts "MCP fallback tetra started for solid=$solid_id comp=$comp"',
         "    *currentcollector components $comp",
+        '    *createmark elems 1 "by comp name" $comp',
+        "    if {[catch {hm_marklength elems 1} existing_count]} {set existing_count 0}",
+        "    if {$existing_count > 0} {catch {*deletemark elems 1}}",
         "    *createmark solids 2 $solid_id",
         "    *createmark surfs 1 \"by solids\" $solid_id",
         "    if {[catch {hm_marklength surfs 1} sc] || $sc == 0} {return 0}",
@@ -2599,8 +2614,8 @@ def generate_cutsection_spin_hex_tcl(
         "    if {[mcp_mark_count elems 2] == 0 || [mcp_mark_count solids 2] == 0} {return 0}",
         "    if {[catch {hm_getboundingbox elems 2 0 0 0} ebb]} {return 0}",
         "    if {[catch {hm_getboundingbox solids 2 0 0 0} sbb] || [llength $sbb] < 6} {",
-        '        puts "MCP mesh-solid fit skipped: solid bbox unavailable for pure CAD solid=$solid_id."',
-        "        return 1",
+        '        puts "MCP mesh-solid fit failed: solid bbox unavailable for solid=$solid_id; rejecting hex candidate."',
+        "        return 0",
         "    }",
         "    set sx [expr {abs([lindex $sbb 3] - [lindex $sbb 0])}]",
         "    set sy [expr {abs([lindex $sbb 4] - [lindex $sbb 1])}]",
@@ -2674,6 +2689,7 @@ def generate_cutsection_spin_hex_tcl(
         "    foreach mode_pair $mesh_modes {",
         "        set interactive_mode [lindex $mode_pair 0]",
         "        set face_mode [lindex $mode_pair 1]",
+        "        set before_section_mesh [mcp_all_elems]",
         "        *createmark surfaces 1 $sid",
         "        catch {*setedgedensitylinkwithaspectratio -1}",
         "        *setedgedensitylink 1",
@@ -2686,11 +2702,17 @@ def generate_cutsection_spin_hex_tcl(
         "        } mesh_err]} {",
         '            puts "MCP cut-section surface automesh failed on surface=$sid face_mode=$face_mode: $mesh_err"',
         "            catch {*ameshclearsurface}",
+        "            set partial_shells [mcp_list_subtract [mcp_all_elems] $before_section_mesh]",
+        "            mcp_delete_elems $partial_shells",
         "            continue",
         "        }",
+        "        set new_section_shells [mcp_list_subtract [mcp_all_elems] $before_section_mesh]",
         '        *createmark elems 1 "by surface" $sid',
         "        set shells [hm_getmark elems 1]",
-        "        if {[llength $shells] == 0} {continue}",
+        "        if {[llength $shells] == 0} {",
+        "            mcp_delete_elems $new_section_shells",
+        "            continue",
+        "        }",
         "        set quads 0",
         "        set maxdist 0.0",
         "        foreach eid $shells {",
@@ -2703,9 +2725,11 @@ def generate_cutsection_spin_hex_tcl(
         "        }",
         "        if {$quads == [llength $shells] && $maxdist <= $plane_tol} {",
         '            puts "MCP accepted true section surface=$sid mesh_mode=$face_mode shells=[llength $shells] maxdist=$maxdist plane_tol=$plane_tol"',
+        "            set extra_shells [mcp_list_subtract $new_section_shells $shells]",
+        "            mcp_delete_elems $extra_shells",
         "            return $shells",
         "        }",
-        "        mcp_delete_elems $shells",
+        "        mcp_delete_elems $new_section_shells",
         "    }",
         "    return {}",
         "}",
