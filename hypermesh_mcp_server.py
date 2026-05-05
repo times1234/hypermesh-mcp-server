@@ -44,15 +44,19 @@ HyperMesh meshing strategy for this workstation:
    chooses it. Continue only when the source face is a mapped, 100% quad mesh
    created with uniform per-face edge seeding. If that cannot be guaranteed,
    try a spin-hex strategy for suitable revolved bodies, otherwise fall back to
-   tetra.
+   tetra. The generated workflow must validate that real 3D hex elements were
+   created; a leftover 2D section alone is a failure.
 7. For obvious revolved bodies, prefer spin hex meshing, but never invent the
    section from guessed radii or from a side/end face. First split the solid with
    a real middle cutting plane, use only the newly created surfaces that lie on
    that cutting plane as 2D section sources, mesh those section surfaces as 100%
    quads, then spin to 3D. If the true cut section cannot be guaranteed as all
-   quads, fall back to the tetra strategy.
-8. Do not overuse drag. Use spin where the geometry is a clean revolved part;
-   use tetra when drag/spin would force bad topology.
+   quads, or if spin creates no valid 3D hex elements, clean up temporary shells
+   and fall back to the tetra strategy.
+8. Try a structured hex route before tetra when the geometry supports it:
+   drag for simple constant-section extrusions, spin for clean true-section
+   revolved solids, cut-section spin for stepped/recessed revolved solids.
+   If the chosen hex route fails validation, fall back to tetra for that object.
 9. Component names should describe the physical object, not the mesh type.
    Examples: housing, shaft_ring, spacer_block_upper, support_flange.
 10. Do not repair quality by blindly refining the whole mesh. Prefer strategy
@@ -483,6 +487,7 @@ def classify_hypermesh_part_strategy(
                     "inner and outer circumference seed counts match",
                     "source face contains only quads before drag",
                     "drag result contains hex elements only",
+                    "if no valid 3D hex elements are created, clean up and fall back to tetra",
                     "3D vol skew <= 0.99",
                 ],
             }
@@ -512,6 +517,7 @@ def classify_hypermesh_part_strategy(
                 "accepted section shell nodes lie on the cut plane",
                 "accepted section contains only quads before spin",
                 "spin result contains hex elements only",
+                "a point on the actual spin axis must be supplied separately from the cut-plane point",
                 "3D vol skew <= 0.99, or report remaining failures without deleting",
             ],
         }
@@ -767,6 +773,10 @@ def generate_guarded_drag_hex_tcl(
     element_size: float,
     component_name: str,
     axis: str = "z",
+    solid_id: int | None = None,
+    fit_tolerance_ratio: float = 0.05,
+    retry_count: int = 1,
+    fallback_to_tetra: bool = True,
     layer_count: int | None = None,
     matched_edge_groups: list[list[int]] | None = None,
     target_density: int | None = None,
@@ -781,6 +791,12 @@ def generate_guarded_drag_hex_tcl(
         raise ValueError("component_name cannot be empty.")
     if target_density is not None and target_density <= 0:
         raise ValueError("target_density must be greater than 0.")
+    if solid_id is not None and solid_id <= 0:
+        raise ValueError("solid_id must be greater than 0 when supplied.")
+    if fit_tolerance_ratio <= 0:
+        raise ValueError("fit_tolerance_ratio must be greater than 0.")
+    if retry_count < 0:
+        raise ValueError("retry_count cannot be negative.")
 
     axis_key = axis.strip().lower()
     vectors = {
@@ -796,6 +812,7 @@ def generate_guarded_drag_hex_tcl(
         1, round(float(drag_distance) / float(element_size))
     )
     comp = component_name.replace('"', '\\"')
+    fallback_enabled = "1" if fallback_to_tetra else "0"
     group_lines: list[str] = []
     if matched_edge_groups:
         group_text = " ".join(
@@ -844,9 +861,81 @@ def generate_guarded_drag_hex_tcl(
         "# If the source face is not mapped 100% quads after uniform seeding, skip drag.",
         f'set drag_component "{comp}"',
         f"set source_surface {int(source_surface_id)}",
+        f"set target_solid {int(solid_id) if solid_id is not None else 0}",
         f"set elem_size {float(element_size)}",
         f"set drag_distance {float(drag_distance)}",
         f"set drag_layers {int(layers)}",
+        f"set fit_tol_ratio {float(fit_tolerance_ratio)}",
+        f"set retry_count {int(retry_count)}",
+        f"set fallback_to_tetra {fallback_enabled}",
+        "proc mcp_all_elems {} {",
+        '    *createmark elems 1 "all"',
+        "    return [hm_getmark elems 1]",
+        "}",
+        "proc mcp_list_subtract {a b} {",
+        "    array set seen {}",
+        "    foreach x $b {set seen($x) 1}",
+        "    set out {}",
+        "    foreach x $a {if {![info exists seen($x)]} {lappend out $x}}",
+        "    return $out",
+        "}",
+        "proc mcp_count_hex8 {elems} {",
+        "    set hexes 0",
+        "    foreach eid $elems {",
+        "        if {[catch {hm_getvalue elems id=$eid dataname=config} cfg]} {continue}",
+        "        if {$cfg == 208} {incr hexes}",
+        "    }",
+        "    return $hexes",
+        "}",
+        "proc mcp_bbox_fit_ok {elems solid_id fit_ratio elem_size} {",
+        "    if {$solid_id <= 0} {return 1}",
+        "    if {[llength $elems] == 0} {return 0}",
+        "    eval *createmark elems 2 $elems",
+        "    *createmark solids 2 $solid_id",
+        "    if {[catch {hm_getboundingbox elems 2 0 0 0} ebb]} {return 0}",
+        "    if {[catch {hm_getboundingbox solids 2 0 0 0} sbb]} {return 0}",
+        "    set sx [expr {abs([lindex $sbb 3] - [lindex $sbb 0])}]",
+        "    set sy [expr {abs([lindex $sbb 4] - [lindex $sbb 1])}]",
+        "    set sz [expr {abs([lindex $sbb 5] - [lindex $sbb 2])}]",
+        "    set diag [expr {sqrt($sx*$sx + $sy*$sy + $sz*$sz)}]",
+        "    set tol [expr {max($elem_size * 1.5, $diag * $fit_ratio)}]",
+        "    for {set i 0} {$i < 6} {incr i} {",
+        "        if {abs([lindex $ebb $i] - [lindex $sbb $i]) > $tol} {return 0}",
+        "    }",
+        "    return 1",
+        "}",
+        "proc mcp_tetra_fallback {solid_id comp elem_size} {",
+        "    if {$solid_id <= 0} {return 0}",
+        '    puts "MCP fallback tetra started for solid=$solid_id comp=$comp"',
+        "    *currentcollector components $comp",
+        "    *createmark solids 2 $solid_id",
+        "    *createmark surfs 1 \"by solids\" $solid_id",
+        "    if {[catch {hm_marklength surfs 1} sc] || $sc == 0} {return 0}",
+        "    set before_shell_mesh [mcp_all_elems]",
+        "    set max_size [expr {max($elem_size * 1.8, 0.75)}]",
+        "    set min_size 0.50",
+        "    if {$elem_size < 0.55} {set min_size [expr {$elem_size * 0.60}]}",
+        "    *createarray 3 0 0 0",
+        "    if {[catch {*defaultmeshsurf_growth 1 $elem_size 3 3 2 1 1 1 35 0 $min_size $max_size 0.1 15 1.23 1 3 1 0} surf_err]} {return 0}",
+        "    set shell_ids [mcp_list_subtract [mcp_all_elems] $before_shell_mesh]",
+        "    if {[llength $shell_ids] == 0} {return 0}",
+        "    eval *createmark elems 1 $shell_ids",
+        "    set tet_max [expr {max($elem_size * 1.9, 0.85)}]",
+        "    set tet_min 0.50",
+        "    if {$elem_size < 0.55} {set tet_min [expr {$elem_size * 0.60}]}",
+        "    *createstringarray 2 \\",
+        "        \"tet: 547 1.2 2 $tet_max 0.8 $tet_min 0\" \\",
+        "        \"pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew='0.99,0.95,0.90,1'\"",
+        "    if {[catch {*tetmesh elems 1 1 elems 0 -1 1 2} tet_err]} {",
+        "        eval *createmark elems 1 $shell_ids",
+        "        catch {*deletemark elems 1}",
+        "        return 0",
+        "    }",
+        "    eval *createmark elems 1 $shell_ids",
+        "    catch {*deletemark elems 1}",
+        '    puts "MCP fallback tetra completed."',
+        "    return 1",
+        "}",
         'catch {*beginhistorystate "MCP guarded drag hex"}',
         '*currentcollector components "$drag_component"',
         "catch {*setedgedensitylinkwithaspectratio -1}",
@@ -868,11 +957,30 @@ def generate_guarded_drag_hex_tcl(
         "if {[llength $source_shells] == 0 || $quad_count != [llength $source_shells]} {",
         '    puts "MCP guarded drag skipped: source face is not all quads."',
         "    if {[llength $source_shells] > 0} { eval *createmark elems 1 $source_shells; catch {*deletemark elems 1} }",
+        "    if {$fallback_to_tetra} {mcp_tetra_fallback $target_solid $drag_component $elem_size}",
         "} else {",
-        f"    *createvector 1 {vx} {vy} {vz}",
-        "    *meshdragelements2 1 1 $drag_distance $drag_layers 0 0.0 0",
+        "    set hex_success 0",
+        "    set attempt 0",
+        "    while {$attempt <= $retry_count && !$hex_success} {",
+        '        puts "MCP guarded drag attempt=$attempt elem_size=$elem_size"',
+        "        set before_elems [mcp_all_elems]",
+        f"        *createvector 1 {vx} {vy} {vz}",
+        "        *meshdragelements2 1 1 $drag_distance $drag_layers 0 0.0 0",
+        "        set new_elems [mcp_list_subtract [mcp_all_elems] $before_elems]",
+        "        set hex_count [mcp_count_hex8 $new_elems]",
+        "        set fit_ok [mcp_bbox_fit_ok $new_elems $target_solid $fit_tol_ratio $elem_size]",
+        "        if {[llength $new_elems] > 0 && $hex_count == [llength $new_elems] && $fit_ok} {",
+        "            set hex_success 1",
+        '            puts "MCP guarded drag completed: hex8=$hex_count fit_ok=$fit_ok"',
+        "        } else {",
+        '            puts "MCP guarded drag invalid: new_elements=[llength $new_elems] hex8=$hex_count fit_ok=$fit_ok; cleaning and retrying/falling back."',
+        "            if {[llength $new_elems] > 0} { eval *createmark elems 1 $new_elems; catch {*deletemark elems 1} }",
+        "        }",
+        "        incr attempt",
+        "    }",
         "    eval *createmark elems 1 $source_shells",
         "    catch {*deletemark elems 1}",
+        "    if {!$hex_success && $fallback_to_tetra} {mcp_tetra_fallback $target_solid $drag_component $elem_size}",
         "}",
         'catch {*endhistorystate "MCP guarded drag hex"}',
     ]
@@ -897,6 +1005,10 @@ def generate_guarded_spin_hex_tcl(
     element_size: float,
     component_name: str,
     axis: str = "z",
+    solid_id: int | None = None,
+    fit_tolerance_ratio: float = 0.05,
+    retry_count: int = 1,
+    fallback_to_tetra: bool = True,
     angle_degrees: float = 360.0,
     density: int = 96,
     output_hm_path: str | None = None,
@@ -908,6 +1020,12 @@ def generate_guarded_spin_hex_tcl(
         raise ValueError("density must be greater than 0.")
     if not component_name.strip():
         raise ValueError("component_name cannot be empty.")
+    if solid_id is not None and solid_id <= 0:
+        raise ValueError("solid_id must be greater than 0 when supplied.")
+    if fit_tolerance_ratio <= 0:
+        raise ValueError("fit_tolerance_ratio must be greater than 0.")
+    if retry_count < 0:
+        raise ValueError("retry_count cannot be negative.")
 
     axis_key = axis.strip().lower()
     normals = {
@@ -920,15 +1038,88 @@ def generate_guarded_spin_hex_tcl(
 
     nx, ny, nz = normals[axis_key]
     comp = component_name.replace('"', '\\"')
+    fallback_enabled = "1" if fallback_to_tetra else "0"
     lines = [
         "# HyperMesh MCP generated guarded spin-hex script",
         "# Use for clean revolved bodies. Do not use for flanges with bolt holes or protrusions.",
         "# Precondition: the selected source section should have matched edge seeds and be all quads.",
         f'set spin_component "{comp}"',
         f"set source_surface {int(source_surface_id)}",
+        f"set target_solid {int(solid_id) if solid_id is not None else 0}",
         f"set elem_size {float(element_size)}",
         f"set spin_angle {float(angle_degrees)}",
         f"set spin_density {int(density)}",
+        f"set fit_tol_ratio {float(fit_tolerance_ratio)}",
+        f"set retry_count {int(retry_count)}",
+        f"set fallback_to_tetra {fallback_enabled}",
+        "proc mcp_all_elems {} {",
+        '    *createmark elems 1 "all"',
+        "    return [hm_getmark elems 1]",
+        "}",
+        "proc mcp_list_subtract {a b} {",
+        "    array set seen {}",
+        "    foreach x $b {set seen($x) 1}",
+        "    set out {}",
+        "    foreach x $a {if {![info exists seen($x)]} {lappend out $x}}",
+        "    return $out",
+        "}",
+        "proc mcp_count_hex8 {elems} {",
+        "    set hexes 0",
+        "    foreach eid $elems {",
+        "        if {[catch {hm_getvalue elems id=$eid dataname=config} cfg]} {continue}",
+        "        if {$cfg == 208} {incr hexes}",
+        "    }",
+        "    return $hexes",
+        "}",
+        "proc mcp_bbox_fit_ok {elems solid_id fit_ratio elem_size} {",
+        "    if {$solid_id <= 0} {return 1}",
+        "    if {[llength $elems] == 0} {return 0}",
+        "    eval *createmark elems 2 $elems",
+        "    *createmark solids 2 $solid_id",
+        "    if {[catch {hm_getboundingbox elems 2 0 0 0} ebb]} {return 0}",
+        "    if {[catch {hm_getboundingbox solids 2 0 0 0} sbb]} {return 0}",
+        "    set sx [expr {abs([lindex $sbb 3] - [lindex $sbb 0])}]",
+        "    set sy [expr {abs([lindex $sbb 4] - [lindex $sbb 1])}]",
+        "    set sz [expr {abs([lindex $sbb 5] - [lindex $sbb 2])}]",
+        "    set diag [expr {sqrt($sx*$sx + $sy*$sy + $sz*$sz)}]",
+        "    set tol [expr {max($elem_size * 1.5, $diag * $fit_ratio)}]",
+        "    for {set i 0} {$i < 6} {incr i} {",
+        "        if {abs([lindex $ebb $i] - [lindex $sbb $i]) > $tol} {return 0}",
+        "    }",
+        "    return 1",
+        "}",
+        "proc mcp_tetra_fallback {solid_id comp elem_size} {",
+        "    if {$solid_id <= 0} {return 0}",
+        '    puts "MCP fallback tetra started for solid=$solid_id comp=$comp"',
+        "    *currentcollector components $comp",
+        "    *createmark solids 2 $solid_id",
+        "    *createmark surfs 1 \"by solids\" $solid_id",
+        "    if {[catch {hm_marklength surfs 1} sc] || $sc == 0} {return 0}",
+        "    set before_shell_mesh [mcp_all_elems]",
+        "    set max_size [expr {max($elem_size * 1.8, 0.75)}]",
+        "    set min_size 0.50",
+        "    if {$elem_size < 0.55} {set min_size [expr {$elem_size * 0.60}]}",
+        "    *createarray 3 0 0 0",
+        "    if {[catch {*defaultmeshsurf_growth 1 $elem_size 3 3 2 1 1 1 35 0 $min_size $max_size 0.1 15 1.23 1 3 1 0} surf_err]} {return 0}",
+        "    set shell_ids [mcp_list_subtract [mcp_all_elems] $before_shell_mesh]",
+        "    if {[llength $shell_ids] == 0} {return 0}",
+        "    eval *createmark elems 1 $shell_ids",
+        "    set tet_max [expr {max($elem_size * 1.9, 0.85)}]",
+        "    set tet_min 0.50",
+        "    if {$elem_size < 0.55} {set tet_min [expr {$elem_size * 0.60}]}",
+        "    *createstringarray 2 \\",
+        "        \"tet: 547 1.2 2 $tet_max 0.8 $tet_min 0\" \\",
+        "        \"pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew='0.99,0.95,0.90,1'\"",
+        "    if {[catch {*tetmesh elems 1 1 elems 0 -1 1 2} tet_err]} {",
+        "        eval *createmark elems 1 $shell_ids",
+        "        catch {*deletemark elems 1}",
+        "        return 0",
+        "    }",
+        "    eval *createmark elems 1 $shell_ids",
+        "    catch {*deletemark elems 1}",
+        '    puts "MCP fallback tetra completed."',
+        "    return 1",
+        "}",
         'catch {*beginhistorystate "MCP guarded spin hex"}',
         '*currentcollector components "$spin_component"',
         "*createmark surfaces 1 $source_surface",
@@ -952,11 +1143,30 @@ def generate_guarded_spin_hex_tcl(
         "if {[llength $source_shells] == 0 || $quad_count != [llength $source_shells]} {",
         '    puts "MCP guarded spin skipped: source section is not all quads."',
         "    if {[llength $source_shells] > 0} { eval *createmark elems 1 $source_shells; catch {*deletemark elems 1} }",
+        "    if {$fallback_to_tetra} {mcp_tetra_fallback $target_solid $spin_component $elem_size}",
         "} else {",
-        f"    *createplane 1 {nx} {ny} {nz} $cx $cy $cz",
-        "    *meshspinelements2 1 1 $spin_angle $spin_density 1 0.0 0",
+        "    set hex_success 0",
+        "    set attempt 0",
+        "    while {$attempt <= $retry_count && !$hex_success} {",
+        '        puts "MCP guarded spin attempt=$attempt elem_size=$elem_size"',
+        "        set before_elems [mcp_all_elems]",
+        f"        *createplane 1 {nx} {ny} {nz} $cx $cy $cz",
+        "        *meshspinelements2 1 1 $spin_angle $spin_density 1 0.0 0",
+        "        set new_elems [mcp_list_subtract [mcp_all_elems] $before_elems]",
+        "        set hex_count [mcp_count_hex8 $new_elems]",
+        "        set fit_ok [mcp_bbox_fit_ok $new_elems $target_solid $fit_tol_ratio $elem_size]",
+        "        if {[llength $new_elems] > 0 && $hex_count == [llength $new_elems] && $fit_ok} {",
+        "            set hex_success 1",
+        '            puts "MCP guarded spin completed: hex8=$hex_count fit_ok=$fit_ok"',
+        "        } else {",
+        '            puts "MCP guarded spin invalid: new_elements=[llength $new_elems] hex8=$hex_count fit_ok=$fit_ok; cleaning and retrying/falling back."',
+        "            if {[llength $new_elems] > 0} { eval *createmark elems 1 $new_elems; catch {*deletemark elems 1} }",
+        "        }",
+        "        incr attempt",
+        "    }",
         "    eval *createmark elems 1 $source_shells",
         "    catch {*deletemark elems 1}",
+        "    if {!$hex_success && $fallback_to_tetra} {mcp_tetra_fallback $target_solid $spin_component $elem_size}",
         "}",
         'catch {*endhistorystate "MCP guarded spin hex"}',
     ]
@@ -986,7 +1196,10 @@ def generate_cutsection_spin_hex_tcl(
     element_size: float = 0.7,
     density: int = 96,
     plane_tolerance: float = 0.02,
+    fit_tolerance_ratio: float = 0.05,
+    retry_count: int = 1,
     delete_existing_component_elements: bool = True,
+    fallback_to_tetra: bool = True,
     output_hm_path: str | None = None,
 ) -> dict[str, Any]:
     """Generate generic real cut-section spin-hex Tcl for a stepped/recessed revolved solid."""
@@ -998,6 +1211,10 @@ def generate_cutsection_spin_hex_tcl(
         raise ValueError("density must be greater than 0.")
     if plane_tolerance <= 0:
         raise ValueError("plane_tolerance must be greater than 0.")
+    if fit_tolerance_ratio <= 0:
+        raise ValueError("fit_tolerance_ratio must be greater than 0.")
+    if retry_count < 0:
+        raise ValueError("retry_count cannot be negative.")
     if not component_name.strip():
         raise ValueError("component_name cannot be empty.")
     if len(split_plane_normal) != 3 or len(split_plane_point) != 3:
@@ -1010,25 +1227,44 @@ def generate_cutsection_spin_hex_tcl(
 
     nx, ny, nz = [float(v) for v in split_plane_normal]
     px, py, pz = [float(v) for v in split_plane_point]
+    normal_length = (nx * nx + ny * ny + nz * nz) ** 0.5
+    if normal_length <= 0:
+        raise ValueError("split_plane_normal cannot be the zero vector.")
     if spin_axis_point is None:
-        ax, ay, az = px, py, pz
-    else:
-        if len(spin_axis_point) != 3:
-            raise ValueError("spin_axis_point must contain 3 numbers.")
-        ax, ay, az = [float(v) for v in spin_axis_point]
+        raise ValueError(
+            "spin_axis_point is required and must be a point on the real rotation axis. "
+            "Do not reuse split_plane_point unless it is also on that axis."
+        )
+    if len(spin_axis_point) != 3:
+        raise ValueError("spin_axis_point must contain 3 numbers.")
+    ax, ay, az = [float(v) for v in spin_axis_point]
     snx, sny, snz = axis_normals[axis_key]
+    axis_dot = abs(nx * snx + ny * sny + nz * snz) / normal_length
+    if axis_dot > 0.05:
+        raise ValueError(
+            "For cut-section spin, the split plane must contain the spin axis, "
+            "so split_plane_normal must be nearly perpendicular to spin_axis. "
+            "If the cut plane is perpendicular to the axis, use drag for a "
+            "constant-section body or tetra fallback for complex topology."
+        )
     comp = component_name.replace('"', '\\"')
 
     delete_existing = "1" if delete_existing_component_elements else "0"
+    fallback_enabled = "1" if fallback_to_tetra else "0"
     lines = [
         "# HyperMesh MCP generated cut-section spin-hex script",
         "# Use for stepped/recessed revolved solids where an existing face is not a reliable section.",
+        "# The spin axis point must lie on the true rotation axis; the split-plane point alone is not enough.",
+        "# If cut-section spin does not create valid 3D hex elements, this script falls back to tetra.",
         f'set target_component "{comp}"',
         f"set target_solid {int(solid_id)}",
         f"set elem_size {float(element_size)}",
         f"set spin_density {int(density)}",
         f"set plane_tol {float(plane_tolerance)}",
+        f"set fit_tol_ratio {float(fit_tolerance_ratio)}",
+        f"set retry_count {int(retry_count)}",
         f"set delete_existing_component_elements {delete_existing}",
+        f"set fallback_to_tetra {fallback_enabled}",
         f"set split_nx {nx}",
         f"set split_ny {ny}",
         f"set split_nz {nz}",
@@ -1061,6 +1297,79 @@ def generate_cutsection_spin_hex_tcl(
         "    if {[llength $elems] == 0} {return}",
         "    eval *createmark elems 1 $elems",
         "    catch {*deletemark elems 1}",
+        "}",
+        "proc mcp_hex8_count {elems} {",
+        "    set hexes 0",
+        "    foreach eid $elems {",
+        "        if {[catch {hm_getvalue elems id=$eid dataname=config} cfg]} {continue}",
+        "        if {$cfg == 208} {incr hexes}",
+        "    }",
+        "    return $hexes",
+        "}",
+        "proc mcp_bbox_fit_ok {elems solid_id fit_ratio elem_size} {",
+        "    if {[llength $elems] == 0} {return 0}",
+        "    eval *createmark elems 2 $elems",
+        "    *createmark solids 2 $solid_id",
+        "    if {[mcp_mark_count elems 2] == 0 || [mcp_mark_count solids 2] == 0} {return 0}",
+        "    if {[catch {hm_getboundingbox elems 2 0 0 0} ebb]} {return 0}",
+        "    if {[catch {hm_getboundingbox solids 2 0 0 0} sbb]} {return 0}",
+        "    set sx [expr {abs([lindex $sbb 3] - [lindex $sbb 0])}]",
+        "    set sy [expr {abs([lindex $sbb 4] - [lindex $sbb 1])}]",
+        "    set sz [expr {abs([lindex $sbb 5] - [lindex $sbb 2])}]",
+        "    set diag [expr {sqrt($sx*$sx + $sy*$sy + $sz*$sz)}]",
+        "    set tol [expr {max($elem_size * 1.5, $diag * $fit_ratio)}]",
+        "    for {set i 0} {$i < 6} {incr i} {",
+        "        set diff [expr {abs([lindex $ebb $i] - [lindex $sbb $i])}]",
+        "        if {$diff > $tol} {",
+        '            puts "MCP mesh-solid fit failed: bbox_index=$i mesh=[lindex $ebb $i] solid=[lindex $sbb $i] diff=$diff tol=$tol"',
+        "            return 0",
+        "        }",
+        "    }",
+        "    return 1",
+        "}",
+        "proc mcp_tetra_fallback {solid_id comp elem_size} {",
+        '    puts "MCP fallback tetra started for solid=$solid_id comp=$comp"',
+        "    *currentcollector components $comp",
+        "    *createmark solids 2 $solid_id",
+        "    if {[mcp_mark_count solids 2] == 0} {",
+        '        puts "MCP fallback tetra failed: solid is missing."',
+        "        return 0",
+        "    }",
+        "    *createmark surfs 1 \"by solids\" $solid_id",
+        "    if {[mcp_mark_count surfs 1] == 0} {",
+        '        puts "MCP fallback tetra failed: no surfaces found for solid."',
+        "        return 0",
+        "    }",
+        "    set before_shell_mesh [mcp_all_elems]",
+        "    set max_size [expr {max($elem_size * 1.8, 0.75)}]",
+        "    set min_size 0.50",
+        "    if {$elem_size < 0.55} {set min_size [expr {$elem_size * 0.60}]}",
+        "    *createarray 3 0 0 0",
+        "    if {[catch {*defaultmeshsurf_growth 1 $elem_size 3 3 2 1 1 1 35 0 $min_size $max_size 0.1 15 1.23 1 3 1 0} surf_err]} {",
+        '        puts "MCP fallback tetra surface mesh failed: $surf_err"',
+        "        return 0",
+        "    }",
+        "    set shell_ids [mcp_list_subtract [mcp_all_elems] $before_shell_mesh]",
+        "    if {[llength $shell_ids] == 0} {",
+        '        puts "MCP fallback tetra failed: no surface shells created."',
+        "        return 0",
+        "    }",
+        "    eval *createmark elems 1 $shell_ids",
+        "    catch {*triangle_clean_up elems 1 \"aspect=10.0 height=0.2\"}",
+        "    set tet_max [expr {max($elem_size * 1.9, 0.85)}]",
+        "    set tet_min 0.50",
+        "    if {$elem_size < 0.55} {set tet_min [expr {$elem_size * 0.60}]}",
+        "    *createstringarray 2 \\",
+        "        \"tet: 547 1.2 2 $tet_max 0.8 $tet_min 0\" \\",
+        "        \"pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew='0.99,0.95,0.90,1'\"",
+        "    if {[catch {*tetmesh elems 1 1 elems 0 -1 1 2} tet_err]} {",
+        '        puts "MCP fallback tetra volume mesh failed: $tet_err"',
+        "        mcp_delete_elems $shell_ids",
+        "        return 0",
+        "    }",
+        "    mcp_delete_elems $shell_ids",
+        '    puts "MCP fallback tetra completed."',
+        "    return 1",
         "}",
         "proc mcp_node_plane_dist {nid nx ny nz px py pz} {",
         "    set x [hm_getvalue nodes id=$nid dataname=x]",
@@ -1100,6 +1409,7 @@ def generate_cutsection_spin_hex_tcl(
         "}",
         'catch {*beginhistorystate "MCP cut-section spin hex"}',
         '*currentcollector components "$target_component"',
+        "set hex_success 0",
         "if {$delete_existing_component_elements} {",
         '    *createmark elems 1 "by comp name" $target_component',
         "    if {[mcp_mark_count elems 1] > 0} {catch {*deletemark elems 1}}",
@@ -1115,29 +1425,46 @@ def generate_cutsection_spin_hex_tcl(
         "    } else {",
         "        set new_surfs [lsort -integer [mcp_list_subtract [mcp_all_surfs] $before_surfs]]",
         '        puts "MCP cut-section new_surfs=$new_surfs"',
-        "        set seed_shells {}",
-        "        foreach sid $new_surfs {",
-        "            set shells [mcp_mesh_true_section $sid $elem_size $split_nx $split_ny $split_nz $split_px $split_py $split_pz $plane_tol]",
-        "            foreach e $shells {lappend seed_shells $e}",
-        "        }",
-        "        if {[llength $seed_shells] == 0} {",
-        '            puts "MCP cut-section spin skipped: no true all-quad section surfaces were found."',
-        "        } else {",
+        "        set attempt 0",
+        "        while {$attempt <= $retry_count && !$hex_success} {",
+        "            set attempt_size $elem_size",
+        '            puts "MCP cut-section spin attempt=$attempt elem_size=$attempt_size"',
+        "            set seed_shells {}",
+        "            foreach sid $new_surfs {",
+        "                set shells [mcp_mesh_true_section $sid $attempt_size $split_nx $split_ny $split_nz $split_px $split_py $split_pz $plane_tol]",
+        "                foreach e $shells {lappend seed_shells $e}",
+        "            }",
+        "            if {[llength $seed_shells] == 0} {",
+        '                puts "MCP cut-section spin attempt failed: no true all-quad section surfaces were found."',
+        "                incr attempt",
+        "                continue",
+        "            }",
         "            set before_elems [mcp_all_elems]",
         "            eval *createmark elems 1 $seed_shells",
         f"            *createplane 1 {snx} {sny} {snz} $axis_px $axis_py $axis_pz",
         "            if {[catch {*meshspinelements2 1 1 360 $spin_density 1 0.0 0} spin_err]} {",
-        '                puts "MCP cut-section spin failed: $spin_err"',
+        '                puts "MCP cut-section spin attempt failed: $spin_err"',
         "            } else {",
         "                set new_elems [mcp_list_subtract [mcp_all_elems] $before_elems]",
-        "                if {[llength $new_elems] > 0} {",
+        "                set hex_count [mcp_hex8_count $new_elems]",
+        "                set fit_ok [mcp_bbox_fit_ok $new_elems $target_solid $fit_tol_ratio $attempt_size]",
+        "                if {[llength $new_elems] > 0 && $hex_count == [llength $new_elems] && $fit_ok} {",
         "                    eval *createmark elems 1 $new_elems",
         "                    catch {*movemark elems 1 $target_component}",
+        "                    set hex_success 1",
+        '                    puts "MCP cut-section spin completed: hex8=$hex_count fit_ok=$fit_ok"',
+        "                } else {",
+        '                    puts "MCP cut-section spin invalid: new_elements=[llength $new_elems] hex8=$hex_count fit_ok=$fit_ok; cleaning and retrying/falling back."',
+        "                    mcp_delete_elems $new_elems",
         "                }",
         "            }",
         "            mcp_delete_elems $seed_shells",
+        "            incr attempt",
         "        }",
         "    }",
+        "}",
+        "if {!$hex_success && $fallback_to_tetra} {",
+        "    mcp_tetra_fallback $target_solid $target_component $elem_size",
         "}",
         'catch {*endhistorystate "MCP cut-section spin hex"}',
     ]

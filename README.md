@@ -35,6 +35,14 @@ generation, and input/output paths remain explicit.
 ## Generic Strategy Rules
 
 Use `classify_hypermesh_part_strategy` and geometry facts, not component names.
+The intended order is:
+
+1. Try the structured hex route that matches the geometry: drag, spin, or
+   cut-section spin.
+2. Validate that real 3D hex elements were created. A leftover 2D section mesh
+   by itself is a failure.
+3. If the hex route fails, clean up temporary/invalid elements and mesh that
+   object with tetra.
 
 ### Tetra
 
@@ -62,7 +70,11 @@ Preconditions:
 - corresponding logical edge groups are forced to matched seed counts
 - the source face meshes as 100% quads
 
-If these cannot be proven, use tetra.
+Pass `solid_id` when possible. The generator then validates that the generated
+hex8 mesh bounding box fits the target solid. If the drag result is missing,
+non-hex, or poorly fitted, it deletes invalid elements, retries once with the
+same element size, and then falls back to tetra when `fallback_to_tetra` is
+enabled.
 
 ### Spin Hex
 
@@ -74,6 +86,10 @@ Preconditions:
 - source section is a real cross-section
 - source section meshes as 100% quads
 - spin result contains hex elements only
+
+Pass `solid_id` when possible so the generated mesh can be checked against the
+target solid. Failed fit/non-hex results are cleaned, retried once with the same
+element size, then sent to tetra fallback when enabled.
 
 If the solid is stepped, recessed, grooved, or the source section is ambiguous,
 use cut-section spin instead.
@@ -97,8 +113,20 @@ Required inputs:
 - `solid_id`
 - `component_name`
 - split plane normal and point
-- spin axis and a point on the spin axis
+- spin axis and a point on the spin axis; this is required and must be on the
+  real rotation axis, not merely any point on the split plane
 - element size and spin density
+
+The split plane must contain the spin axis. In practical terms, the split plane
+normal should be nearly perpendicular to the spin axis. If the cut plane is
+perpendicular to the axis and creates an annular transverse section, that is a
+drag-style source section for a constant-section body, not a spin section.
+
+The generator validates the spin result. If no valid 3D hex8 elements are
+created, it deletes temporary section/invalid elements and retries once with the
+same requested element size. It does not shrink/refine the hex mesh for the
+retry. If the second attempt still fails, it falls back to tetra when
+`fallback_to_tetra` is enabled.
 
 ## Quality Policy
 
@@ -132,4 +160,3 @@ user explicitly asks.
 ```
 
 Adjust paths for your workstation.
-
