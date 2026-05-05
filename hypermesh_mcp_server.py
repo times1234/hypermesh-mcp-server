@@ -35,17 +35,15 @@ HyperMesh meshing strategy for this workstation:
 5. For tetra strategy: first make 2D surface-deviation R-trias mesh, check/fix
    2D aspect > 10, then generate volume mesh with tetramesh, then check/fix
    volume skew > 0.99.
-6. For simple straight tube/cylinder drag hex meshing, first impose the same
-   seed count on every logical edge of the selected 2D source face before
-   automesh. Example: if one source-face edge previews as 51 and another as 58,
-   compute one common target from the actual face size and target element size,
-   then force source-face edge indices 0/1/2/3 to that target before automesh. Do
-   not hard-code 51 or 58 unless the geometry/mesh-size calculation actually
-   chooses it. Continue only when the source face is a mapped, 100% quad mesh
-   created with uniform per-face edge seeding. If that cannot be guaranteed,
-   try a spin-hex strategy for suitable revolved bodies, otherwise fall back to
-   tetra. The generated workflow must validate that real 3D hex elements were
-   created; a leftover 2D section alone is a failure.
+6. For simple straight tube/cylinder drag hex meshing, match logical edge seed
+   counts, but do not blindly promote the whole source face to the largest outer
+   edge count. If preview seed counts or edge lengths differ greatly, choose a
+   balanced common count from the section scale (geometric-mean style) and use
+   that one count for the mapped source face. Continue only when the source face
+   is a mapped, 100% quad mesh. If that cannot be guaranteed, try a spin-hex
+   strategy for suitable revolved bodies, otherwise fall back to tetra. The
+   generated workflow must validate that real 3D hex elements were created; a
+   leftover 2D section alone is a failure.
 7. For obvious revolved bodies, prefer spin hex meshing, but never invent the
    section from guessed radii or from a side/end face. First split the solid with
    a real middle cutting plane, use only the newly created surfaces that lie on
@@ -57,12 +55,18 @@ HyperMesh meshing strategy for this workstation:
    drag for simple constant-section extrusions, spin for clean true-section
    revolved solids, cut-section spin for stepped/recessed revolved solids.
    If the chosen hex route fails validation, fall back to tetra for that object.
+   Clean bearing/ring-like revolved bodies should get a real cut-section spin
+   attempt before tetra; direct surface-id spin is not enough unless the surface
+   is already the true radial cross-section.
 9. Component names should describe the physical object, not the mesh type.
    Examples: housing, shaft_ring, spacer_block_upper, support_flange.
 10. Do not repair quality by blindly refining the whole mesh. Prefer strategy
-   changes, local 3D smoothing/remesh, or sliver-tetra repair. If bad volume
-   elements still cannot be fixed, keep them in the model and report them; do
-   not delete unfixable quality-failed elements unless the user explicitly asks.
+    changes, local 3D smoothing/remesh, or sliver-tetra repair. If bad volume
+    elements still cannot be fixed, keep them in the model and report them; do
+    not delete unfixable quality-failed elements unless the user explicitly asks.
+11. Gear or spline teeth are local fine-feature regions. Detect them as repeated
+    radial tooth/protrusion faces and mesh those faces smaller; keep shaft and
+    hub faces at the normal base size.
 """
 
 GENERIC_MESHING_RULES = {
@@ -86,6 +90,11 @@ GENERIC_MESHING_RULES = {
             "all logical source-face edge groups can be forced to matched seed counts",
             "the source face meshes as 100% quads",
         ],
+        "seed_policy": (
+            "Match logical source-face counts, but when preview counts or edge "
+            "lengths are highly different, choose a balanced common count rather "
+            "than forcing inner edges up to the outer-edge count."
+        ),
         "fallback": "tetra_surface_deviation_rtrias",
     },
     "spin_hex_guarded": {
@@ -109,6 +118,20 @@ GENERIC_MESHING_RULES = {
             "spin the accepted 2D section into 3D hex elements",
         ],
         "fallback": "tetra_surface_deviation_rtrias",
+    },
+    "gear_aware_tetra": {
+        "use_when": [
+            "gear, pinion, spline, or many repeated radial teeth are present",
+            "tooth surfaces need a smaller local 2D size than shaft/hub surfaces",
+            "the whole part is not safely sweepable as one structured hex block",
+        ],
+        "method": [
+            "identify repeated tooth/flank/root surfaces as the gear region",
+            "surface mesh shaft/hub surfaces with the base size",
+            "surface mesh tooth-region surfaces with a smaller gear size",
+            "tetra mesh the solid from the mixed-size surface shell mesh",
+        ],
+        "fallback": "tetra_surface_deviation_rtrias with uniform base size",
     },
 }
 
@@ -248,6 +271,42 @@ def _resolve_hypermesh_gui(gui_path: str | None = None) -> Path:
 
 def _quote_tcl_path(path: str | os.PathLike[str]) -> str:
     return str(Path(path)).replace("\\", "/").replace('"', '\\"')
+
+
+def _balanced_seed_density(
+    *,
+    element_size: float,
+    target_density: int | None,
+    preview_edge_seed_counts: list[int] | None,
+    source_edge_lengths: list[float] | None,
+    ratio_threshold: float,
+) -> tuple[int | None, str]:
+    counts: list[int] = []
+    if preview_edge_seed_counts:
+        counts.extend(max(1, int(count)) for count in preview_edge_seed_counts)
+    elif source_edge_lengths:
+        counts.extend(
+            max(1, round(float(length) / float(element_size)))
+            for length in source_edge_lengths
+        )
+
+    if not counts:
+        return target_density, "explicit" if target_density else "bbox_estimate"
+
+    low = min(counts)
+    high = max(counts)
+    ratio = high / max(low, 1)
+    if ratio >= ratio_threshold:
+        balanced = round((low * high) ** 0.5)
+        source = f"balanced_from_range_{low}_{high}"
+    elif target_density:
+        balanced = int(target_density)
+        source = "explicit"
+    else:
+        balanced = round(sum(counts) / len(counts))
+        source = f"average_from_preview_{low}_{high}"
+
+    return max(4, min(120, int(balanced))), source
 
 
 def _ensure_runs_dir() -> Path:
@@ -434,6 +493,9 @@ def classify_hypermesh_part_strategy(
     is_constant_section_extrusion: bool = False,
     is_clean_revolved_section: bool = False,
     is_stepped_or_recessed_revolved: bool = False,
+    has_gear_teeth: bool = False,
+    has_many_repeated_radial_teeth: bool = False,
+    tooth_count: int | None = None,
     source_faces_can_be_all_quads: bool = False,
     matched_inner_outer_seed_counts: bool = False,
 ) -> dict[str, Any]:
@@ -444,6 +506,13 @@ def classify_hypermesh_part_strategy(
 
     looks_like_flange = is_flange or any(word in text for word in flange_words)
     looks_like_bolted = has_bolt_holes or any(word in text for word in bolt_words)
+    gear_words = ("gear", "pinion", "tooth", "teeth", "spline", "cog")
+    looks_like_gear = (
+        has_gear_teeth
+        or has_many_repeated_radial_teeth
+        or (tooth_count is not None and tooth_count >= 8)
+        or any(word in text for word in gear_words)
+    )
     stepped_tokens = (
         "step",
         "stepped",
@@ -458,6 +527,23 @@ def classify_hypermesh_part_strategy(
     looks_stepped_revolved = is_stepped_or_recessed_revolved or (
         is_clean_revolved_section and any(word in text for word in stepped_tokens)
     )
+
+    if looks_like_gear:
+        return {
+            "success": True,
+            "strategy": "gear_aware_tetra",
+            "reason": (
+                "Repeated radial teeth/spline features need local fine surface "
+                "mesh on tooth faces while shaft and hub faces can keep the base size."
+            ),
+            "required_checks": [
+                "identify tooth/flank/root surfaces as gear region by repeated radial features",
+                "mesh gear-region surfaces with a smaller local element size",
+                "mesh shaft/hub surfaces with the normal base element size",
+                "tet elements remain in the part's own component",
+                "3D vol skew <= 0.99 after repair/report",
+            ],
+        }
 
     if looks_like_flange or looks_like_bolted:
         return {
@@ -536,14 +622,18 @@ def classify_hypermesh_part_strategy(
             }
         return {
             "success": True,
-            "strategy": "tetra_surface_deviation_rtrias",
+            "strategy": "cutsection_spin_hex",
             "reason": (
-                "Revolved body did not prove all-quad source section; fall back "
-                "to tetra strategy."
+                "Clean revolved body but no trusted all-quad source section was "
+                "proven. Split the real solid through the rotation axis and try "
+                "cut-section spin before tetra fallback."
             ),
             "required_checks": [
-                "2D aspect <= 10 after cleanup",
-                "3D vol skew <= 0.99 after repair",
+                "cut plane passes through the intended rotation axis",
+                "accepted section shell nodes lie on the cut plane",
+                "accepted section contains only quads before spin",
+                "spin result contains hex elements only",
+                "if cut-section spin fails validation, fall back to tetra",
             ],
         }
 
@@ -767,6 +857,143 @@ def generate_surface_deviation_rtrias_tcl(
 
 
 @mcp.tool()
+def generate_gear_aware_tetra_tcl(
+    solid_id: int,
+    component_name: str,
+    base_element_size: float,
+    gear_surface_ids: list[int] | None = None,
+    gear_element_size: float | None = None,
+    gear_size_factor: float = 0.45,
+    output_hm_path: str | None = None,
+    min_element_size: float = 0.25,
+    max_deviation: float = 0.1,
+    base_feature_angle: float = 15.0,
+    gear_feature_angle: float = 8.0,
+    growth_rate: float = 1.23,
+) -> dict[str, Any]:
+    """Generate gear-aware tetra Tcl with local fine surface mesh on tooth faces."""
+    if solid_id <= 0:
+        raise ValueError("solid_id must be greater than 0.")
+    if base_element_size <= 0:
+        raise ValueError("base_element_size must be greater than 0.")
+    if gear_size_factor <= 0:
+        raise ValueError("gear_size_factor must be greater than 0.")
+    if min_element_size <= 0:
+        raise ValueError("min_element_size must be greater than 0.")
+    if not component_name.strip():
+        raise ValueError("component_name cannot be empty.")
+
+    comp = component_name.replace('"', '\\"')
+    gear_size = float(gear_element_size) if gear_element_size else float(base_element_size) * float(gear_size_factor)
+    gear_size = max(float(min_element_size), gear_size)
+    base_max_size = max(float(base_element_size) * 1.8, float(min_element_size))
+    gear_max_size = max(gear_size * 1.6, float(min_element_size))
+    gear_ids = " ".join(str(int(value)) for value in (gear_surface_ids or []))
+    gear_id_count = len(gear_surface_ids or [])
+    lines = [
+        "# HyperMesh MCP generated gear-aware tetra script",
+        "# Use for gear/pinion/spline shafts: tooth/flank/root surfaces get local fine mesh; shaft/hub surfaces keep base size.",
+        "# Pass gear_surface_ids for the repeated tooth region. If omitted, this falls back to uniform base-size tetra.",
+        f'set target_component "{comp}"',
+        f"set target_solid {int(solid_id)}",
+        f"set base_size {float(base_element_size)}",
+        f"set gear_size {gear_size}",
+        f"set min_size {float(min_element_size)}",
+        f"set base_max_size {base_max_size}",
+        f"set gear_max_size {gear_max_size}",
+        f"set max_dev {float(max_deviation)}",
+        f"set base_feature_angle {float(base_feature_angle)}",
+        f"set gear_feature_angle {float(gear_feature_angle)}",
+        f"set growth_rate {float(growth_rate)}",
+        f"set gear_surfs {{{gear_ids}}}",
+        f"set gear_surface_count {gear_id_count}",
+        "proc mcp_all_elems {} {",
+        '    *createmark elems 1 "all"',
+        "    return [hm_getmark elems 1]",
+        "}",
+        "proc mcp_list_subtract {a b} {",
+        "    array set seen {}",
+        "    foreach x $b {set seen($x) 1}",
+        "    set out {}",
+        "    foreach x $a {if {![info exists seen($x)]} {lappend out $x}}",
+        "    return $out",
+        "}",
+        "proc mcp_mark_count {entity mark_id} {",
+        "    if {[catch {hm_marklength $entity $mark_id} n]} {return 0}",
+        "    return $n",
+        "}",
+        "proc mcp_delete_elems {elems} {",
+        "    if {[llength $elems] == 0} {return}",
+        "    eval *createmark elems 1 $elems",
+        "    catch {*deletemark elems 1}",
+        "}",
+        "proc mcp_mesh_marked_surfs {size max_size feature_angle} {",
+        "    if {[mcp_mark_count surfs 1] == 0} {return}",
+        "    *createarray 3 0 0 0",
+        "    *defaultmeshsurf_growth 1 $size 3 3 2 1 1 1 35 0 $::mcp_min_size $max_size $::mcp_max_dev $feature_angle $::mcp_growth_rate 1 3 1 0",
+        "}",
+        'catch {*beginhistorystate "MCP gear-aware tetra"}',
+        '*currentcollector components "$target_component"',
+        "set ::mcp_min_size $min_size",
+        "set ::mcp_max_dev $max_dev",
+        "set ::mcp_growth_rate $growth_rate",
+        "set before_shell_mesh [mcp_all_elems]",
+        "*createmark solids 1 $target_solid",
+        "if {[mcp_mark_count solids 1] == 0} {",
+        '    puts "MCP gear-aware tetra skipped: solid is missing."',
+        "} else {",
+        "    *createmark surfs 2 \"by solids\" $target_solid",
+        "    set all_surfs [hm_getmark surfs 2]",
+        "    if {$gear_surface_count > 0} {",
+        "        set base_surfs [mcp_list_subtract $all_surfs $gear_surfs]",
+        "    } else {",
+        '        puts "MCP gear-aware tetra: no gear_surface_ids supplied; using uniform base-size surface mesh."',
+        "        set base_surfs $all_surfs",
+        "    }",
+        "    if {[llength $base_surfs] > 0} {",
+        "        eval *createmark surfs 1 $base_surfs",
+        "        mcp_mesh_marked_surfs $base_size $base_max_size $base_feature_angle",
+        "    }",
+        "    if {$gear_surface_count > 0} {",
+        "        eval *createmark surfs 1 $gear_surfs",
+        "        mcp_mesh_marked_surfs $gear_size $gear_max_size $gear_feature_angle",
+        "    }",
+        "    set shell_ids [mcp_list_subtract [mcp_all_elems] $before_shell_mesh]",
+        "    if {[llength $shell_ids] == 0} {",
+        '        puts "MCP gear-aware tetra failed: no surface shells created."',
+        "    } else {",
+        "        eval *createmark elems 1 $shell_ids",
+        "        catch {*triangle_clean_up elems 1 \"aspect=10.0 height=0.2\"}",
+        "        set tet_max [expr {max($base_size * 1.9, $gear_size * 2.2)}]",
+        "        *createstringarray 2 \\",
+        "            \"tet: 547 1.2 2 $tet_max 0.8 $min_size 0\" \\",
+        "            \"pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew='0.99,0.95,0.90,1'\"",
+        "        if {[catch {*tetmesh elems 1 1 elems 0 -1 1 2} tet_err]} {",
+        '            puts "MCP gear-aware tetra volume mesh failed: $tet_err"',
+        "            mcp_delete_elems $shell_ids",
+        "        } else {",
+        "            mcp_delete_elems $shell_ids",
+        '            puts "MCP gear-aware tetra completed: base_size=$base_size gear_size=$gear_size gear_surfaces=$gear_surface_count"',
+        "        }",
+        "    }",
+        "}",
+        'catch {*endhistorystate "MCP gear-aware tetra"}',
+    ]
+    if output_hm_path:
+        lines.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
+
+    return {
+        "success": True,
+        "script": "\n".join(lines) + "\n",
+        "strategy": (
+            "Use for gear-like shafts. Identify repeated tooth/flank/root surfaces "
+            "as gear_surface_ids, mesh them with gear_size, and keep shaft/hub "
+            "surfaces at base_size before tetra volume meshing."
+        ),
+    }
+
+
+@mcp.tool()
 def generate_guarded_drag_hex_tcl(
     source_surface_id: int,
     drag_distance: float,
@@ -780,6 +1007,9 @@ def generate_guarded_drag_hex_tcl(
     layer_count: int | None = None,
     matched_edge_groups: list[list[int]] | None = None,
     target_density: int | None = None,
+    preview_edge_seed_counts: list[int] | None = None,
+    source_edge_lengths: list[float] | None = None,
+    seed_balance_ratio_threshold: float = 1.6,
     output_hm_path: str | None = None,
 ) -> dict[str, Any]:
     """Generate guarded drag-hex Tcl: match edge seeds, then all-quad source face or no drag."""
@@ -797,6 +1027,12 @@ def generate_guarded_drag_hex_tcl(
         raise ValueError("fit_tolerance_ratio must be greater than 0.")
     if retry_count < 0:
         raise ValueError("retry_count cannot be negative.")
+    if seed_balance_ratio_threshold <= 1.0:
+        raise ValueError("seed_balance_ratio_threshold must be greater than 1.0.")
+    if preview_edge_seed_counts and any(int(count) <= 0 for count in preview_edge_seed_counts):
+        raise ValueError("preview_edge_seed_counts must contain positive integers.")
+    if source_edge_lengths and any(float(length) <= 0 for length in source_edge_lengths):
+        raise ValueError("source_edge_lengths must contain positive values.")
 
     axis_key = axis.strip().lower()
     vectors = {
@@ -813,6 +1049,13 @@ def generate_guarded_drag_hex_tcl(
     )
     comp = component_name.replace('"', '\\"')
     fallback_enabled = "1" if fallback_to_tetra else "0"
+    balanced_density, density_source = _balanced_seed_density(
+        element_size=float(element_size),
+        target_density=target_density,
+        preview_edge_seed_counts=preview_edge_seed_counts,
+        source_edge_lengths=source_edge_lengths,
+        ratio_threshold=float(seed_balance_ratio_threshold),
+    )
     group_lines: list[str] = []
     if matched_edge_groups:
         group_text = " ".join(
@@ -822,7 +1065,9 @@ def generate_guarded_drag_hex_tcl(
         group_lines.extend(
             [
                 f"set matched_edge_groups {{{group_text}}}",
-                f"set target_density {int(target_density) if target_density else 0}",
+                f"set target_density {int(balanced_density) if balanced_density else 0}",
+                f'set target_density_source "{density_source}"',
+                f"set seed_balance_ratio_threshold {float(seed_balance_ratio_threshold)}",
                 "if {$target_density <= 0} {",
                 "    *createmark surfaces 2 $source_surface",
                 "    set bb [hm_getboundingbox surfaces 2 0 0 0]",
@@ -834,8 +1079,9 @@ def generate_guarded_drag_hex_tcl(
                 "    set target_density [expr {int(round($major / $elem_size))}]",
                 "    if {$target_density < 4} { set target_density 4 }",
                 "    if {$target_density > 120} { set target_density 120 }",
+                '    set target_density_source "bbox_estimate"',
                 "}",
-                'puts "MCP guarded drag uniform source-face target_density=$target_density"',
+                'puts "MCP guarded drag source-face target_density=$target_density source=$target_density_source balance_ratio_threshold=$seed_balance_ratio_threshold"',
                 "foreach edge_group $matched_edge_groups {",
                 "    foreach edge_index $edge_group {",
                 "        # edge_index is 0-based in the order shown by HyperMesh automesh.",
@@ -854,10 +1100,10 @@ def generate_guarded_drag_hex_tcl(
         )
     lines = [
         "# HyperMesh MCP generated guarded drag-hex script",
-        "# Precondition: all logical edges of the drag source face must share",
-        "# one target_density computed from object size / target element size.",
-        "# Example: if the source face previews edge seeds 51 and 58, pass all",
-        "# logical edge indices 0/1/2/3 with the same computed target_density.",
+        "# Precondition: all logical edge groups of the drag source face must share",
+        "# one compatible target_density, but it should be balanced when inner/outer",
+        "# preview counts or edge lengths differ greatly; do not blindly use the largest",
+        "# outer-edge count for the whole section.",
         "# If the source face is not mapped 100% quads after uniform seeding, skip drag.",
         f'set drag_component "{comp}"',
         f"set source_surface {int(source_surface_id)}",
@@ -992,9 +1238,10 @@ def generate_guarded_drag_hex_tcl(
         "script": "\n".join(lines) + "\n",
         "strategy": (
             "Use this only for simple straight tubes/extrusions. Before drag, "
-            "force corresponding edge groups to the same target_density (for "
-            "example 51/58 -> both 58), then require a 100% quad source face. "
-            "Never use it for flanges with bolt holes."
+            "force corresponding edge groups to a compatible target_density. "
+            "When preview counts or edge lengths are highly different, this "
+            "uses a balanced common count instead of promoting every edge to "
+            "the largest outer count. Never use it for flanges with bolt holes."
         ),
     }
 
@@ -1198,6 +1445,8 @@ def generate_cutsection_spin_hex_tcl(
     plane_tolerance: float = 0.02,
     fit_tolerance_ratio: float = 0.05,
     retry_count: int = 1,
+    include_existing_section_surfaces: bool = True,
+    allow_quad_only_fallback: bool = True,
     delete_existing_component_elements: bool = True,
     fallback_to_tetra: bool = True,
     output_hm_path: str | None = None,
@@ -1251,6 +1500,8 @@ def generate_cutsection_spin_hex_tcl(
 
     delete_existing = "1" if delete_existing_component_elements else "0"
     fallback_enabled = "1" if fallback_to_tetra else "0"
+    include_existing = "1" if include_existing_section_surfaces else "0"
+    quad_fallback = "1" if allow_quad_only_fallback else "0"
     lines = [
         "# HyperMesh MCP generated cut-section spin-hex script",
         "# Use for stepped/recessed revolved solids where an existing face is not a reliable section.",
@@ -1263,6 +1514,8 @@ def generate_cutsection_spin_hex_tcl(
         f"set plane_tol {float(plane_tolerance)}",
         f"set fit_tol_ratio {float(fit_tolerance_ratio)}",
         f"set retry_count {int(retry_count)}",
+        f"set include_existing_section_surfaces {include_existing}",
+        f"set allow_quad_only_fallback {quad_fallback}",
         f"set delete_existing_component_elements {delete_existing}",
         f"set fallback_to_tetra {fallback_enabled}",
         f"set split_nx {nx}",
@@ -1291,6 +1544,17 @@ def generate_cutsection_spin_hex_tcl(
         "    foreach x $b {set seen($x) 1}",
         "    set out {}",
         "    foreach x $a {if {![info exists seen($x)]} {lappend out $x}}",
+        "    return $out",
+        "}",
+        "proc mcp_unique_append {base additions} {",
+        "    array set seen {}",
+        "    set out {}",
+        "    foreach x $base {",
+        "        if {![info exists seen($x)]} {set seen($x) 1; lappend out $x}",
+        "    }",
+        "    foreach x $additions {",
+        "        if {![info exists seen($x)]} {set seen($x) 1; lappend out $x}",
+        "    }",
         "    return $out",
         "}",
         "proc mcp_delete_elems {elems} {",
@@ -1380,35 +1644,43 @@ def generate_cutsection_spin_hex_tcl(
         "    return $d",
         "}",
         "proc mcp_mesh_true_section {sid elem_size nx ny nz px py pz plane_tol} {",
-        "    *createmark surfaces 1 $sid",
-        "    catch {*setedgedensitylinkwithaspectratio -1}",
-        "    *setedgedensitylink 1",
-        "    *interactiveremeshsurf 1 $elem_size 1 1 2 1 1",
-        "    *set_meshfaceparams 0 5 1 0 0 1 0.5 1 1",
-        "    *automesh 0 5 1",
-        "    *storemeshtodatabase 1",
-        "    *ameshclearsurface",
-        '    *createmark elems 1 "by surface" $sid',
-        "    set shells [hm_getmark elems 1]",
-        "    if {[llength $shells] == 0} {return {}}",
-        "    set quads 0",
-        "    set maxdist 0.0",
-        "    foreach eid $shells {",
-        "        set cfg [hm_getvalue elems id=$eid dataname=config]",
-        "        if {$cfg == 104 || $cfg == 108} {incr quads}",
-        "        foreach nid [hm_getvalue elems id=$eid dataname=nodes] {",
-        "            set d [mcp_node_plane_dist $nid $nx $ny $nz $px $py $pz]",
-        "            if {$d > $maxdist} {set maxdist $d}",
+        "    set mesh_modes {{1 5}}",
+        "    if {$::mcp_allow_quad_only_fallback} {lappend mesh_modes {4 4}}",
+        "    foreach mode_pair $mesh_modes {",
+        "        set interactive_mode [lindex $mode_pair 0]",
+        "        set face_mode [lindex $mode_pair 1]",
+        "        *createmark surfaces 1 $sid",
+        "        catch {*setedgedensitylinkwithaspectratio -1}",
+        "        *setedgedensitylink 1",
+        "        *interactiveremeshsurf 1 $elem_size $interactive_mode $face_mode 2 1 1",
+        "        *set_meshfaceparams 0 $face_mode 1 0 0 1 0.5 1 1",
+        "        *automesh 0 $face_mode 1",
+        "        *storemeshtodatabase 1",
+        "        *ameshclearsurface",
+        '        *createmark elems 1 "by surface" $sid',
+        "        set shells [hm_getmark elems 1]",
+        "        if {[llength $shells] == 0} {continue}",
+        "        set quads 0",
+        "        set maxdist 0.0",
+        "        foreach eid $shells {",
+        "            set cfg [hm_getvalue elems id=$eid dataname=config]",
+        "            if {$cfg == 104 || $cfg == 108} {incr quads}",
+        "            foreach nid [hm_getvalue elems id=$eid dataname=nodes] {",
+        "                set d [mcp_node_plane_dist $nid $nx $ny $nz $px $py $pz]",
+        "                if {$d > $maxdist} {set maxdist $d}",
+        "            }",
         "        }",
-        "    }",
-        "    if {$quads != [llength $shells] || $maxdist > $plane_tol} {",
+        "        if {$quads == [llength $shells] && $maxdist <= $plane_tol} {",
+        '            puts "MCP accepted true section surface=$sid mesh_mode=$face_mode shells=[llength $shells] maxdist=$maxdist plane_tol=$plane_tol"',
+        "            return $shells",
+        "        }",
         "        mcp_delete_elems $shells",
-        "        return {}",
         "    }",
-        "    return $shells",
+        "    return {}",
         "}",
         'catch {*beginhistorystate "MCP cut-section spin hex"}',
         '*currentcollector components "$target_component"',
+        "set ::mcp_allow_quad_only_fallback $allow_quad_only_fallback",
         "set hex_success 0",
         "if {$delete_existing_component_elements} {",
         '    *createmark elems 1 "by comp name" $target_component',
@@ -1425,13 +1697,21 @@ def generate_cutsection_spin_hex_tcl(
         "    } else {",
         "        set new_surfs [lsort -integer [mcp_list_subtract [mcp_all_surfs] $before_surfs]]",
         '        puts "MCP cut-section new_surfs=$new_surfs"',
+        "        set candidate_surfs $new_surfs",
+        "        if {$include_existing_section_surfaces} {",
+        "            *createmark surfs 2 \"by solids\" $target_solid",
+        "            set solid_surfs [hm_getmark surfs 2]",
+        "            set candidate_surfs [mcp_unique_append $candidate_surfs $solid_surfs]",
+        "        }",
+        '        puts "MCP cut-section candidate_surfs=$candidate_surfs"',
         "        set attempt 0",
         "        while {$attempt <= $retry_count && !$hex_success} {",
         "            set attempt_size $elem_size",
+        "            set effective_plane_tol [expr {max($plane_tol, $attempt_size * 0.05)}]",
         '            puts "MCP cut-section spin attempt=$attempt elem_size=$attempt_size"',
         "            set seed_shells {}",
-        "            foreach sid $new_surfs {",
-        "                set shells [mcp_mesh_true_section $sid $attempt_size $split_nx $split_ny $split_nz $split_px $split_py $split_pz $plane_tol]",
+        "            foreach sid $candidate_surfs {",
+        "                set shells [mcp_mesh_true_section $sid $attempt_size $split_nx $split_ny $split_nz $split_px $split_py $split_pz $effective_plane_tol]",
         "                foreach e $shells {lappend seed_shells $e}",
         "            }",
         "            if {[llength $seed_shells] == 0} {",

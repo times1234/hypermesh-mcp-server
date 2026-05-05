@@ -27,6 +27,7 @@ generation, and input/output paths remain explicit.
 - `classify_hypermesh_part_strategy`: classify a part by geometry features.
 - `generate_surface_automesh_tcl`: generate simple surface automesh Tcl.
 - `generate_surface_deviation_rtrias_tcl`: generate surface deviation + R-trias Tcl.
+- `generate_gear_aware_tetra_tcl`: generate gear/tooth local-refinement tetra Tcl.
 - `generate_guarded_drag_hex_tcl`: generate guarded drag-hex Tcl.
 - `generate_guarded_spin_hex_tcl`: generate guarded spin-hex Tcl for a known true section.
 - `get_cutsection_spin_workflow`: explain the generic cut-section spin workflow.
@@ -43,6 +44,9 @@ The intended order is:
    by itself is a failure.
 3. If the hex route fails, clean up temporary/invalid elements and mesh that
    object with tetra.
+4. For bearing/ring-like revolved bodies, do not stop after direct spin fails.
+   Use a real cut plane through the rotation axis, mesh the true radial section,
+   and spin that section before tetra fallback.
 
 ### Tetra
 
@@ -75,6 +79,12 @@ hex8 mesh bounding box fits the target solid. If the drag result is missing,
 non-hex, or poorly fitted, it deletes invalid elements, retries once with the
 same element size, and then falls back to tetra when `fallback_to_tetra` is
 enabled.
+
+Seed policy: if inner/outer preview counts or edge lengths differ greatly, pass
+`preview_edge_seed_counts` or `source_edge_lengths`. When the largest/smallest
+ratio is at least `seed_balance_ratio_threshold` (default 1.6), the generator
+uses a balanced common count instead of forcing all source edges up to the
+largest outer count.
 
 ### Spin Hex
 
@@ -127,6 +137,29 @@ created, it deletes temporary section/invalid elements and retries once with the
 same requested element size. It does not shrink/refine the hex mesh for the
 retry. If the second attempt still fails, it falls back to tetra when
 `fallback_to_tetra` is enabled.
+
+The cut-section generator also considers existing section surfaces on the target
+solid after a split. This helps when a model has already been split or when
+HyperMesh does not create new surface IDs. If mapped quads fail, it can try a
+quad-only section mesh mode with the same element size before falling back.
+
+### Gear-Aware Tetra
+
+Use `classify_hypermesh_part_strategy` with `has_gear_teeth`,
+`has_many_repeated_radial_teeth`, or `tooth_count` when a shaft contains gear,
+pinion, spline, or repeated radial tooth features.
+
+Then use `generate_gear_aware_tetra_tcl`:
+
+- pass `solid_id` and `component_name`
+- pass `base_element_size` for shaft/hub surfaces
+- pass `gear_surface_ids` for repeated tooth, flank, and root surfaces
+- optionally pass `gear_element_size`; otherwise it uses
+  `base_element_size * gear_size_factor`
+
+If `gear_surface_ids` are not supplied, the script falls back to uniform
+base-size tetra. The MCP should identify tooth-region surfaces by repeated
+radial protrusions/high feature density, not by hard-coded component names.
 
 ## Quality Policy
 
