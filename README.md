@@ -165,6 +165,16 @@ Set one or more of these when geometry inspection shows a gear-like region:
 `has_outer_tooth_band`, `has_repeated_tooth_flanks`, `tooth_count`, or
 `outer_radius_variation_ratio`.
 
+Negative bearing/ring evidence wins over gear hints. If the part is a smooth
+concentric ring, bearing race, or annular-groove-only body, set
+`is_smooth_concentric_ring`, `has_bearing_race_grooves`, or
+`has_annular_grooves_only`; the classifier must not treat it as a gear.
+
+As a last-resort workflow aid, callers may set `name_hint_indicates_gear=True`
+when the user has intentionally named a part as gear. This hint only asks the MCP
+to inspect/refine possible tooth geometry; it does not replace geometry checks,
+and it is still overridden by bearing/ring evidence.
+
 Then use `generate_gear_aware_tetra_tcl`:
 
 - pass `solid_id` and `component_name`
@@ -180,6 +190,12 @@ band from surface radii using `gear_outer_band_fraction` and meshes that band
 finer. This is meant to catch helical gears where tooth surfaces are
 oblique/twisted rather than simple radial faces. If auto-detection finds nothing,
 it falls back to uniform base-size tetra.
+
+For automatic detection, prefer passing `geometry_confirms_gear_teeth=True` only
+after geometry inspection sees tooth peaks/roots, repeated flanks, or twisted
+helical tooth faces. If only the last-resort name hint is available, pass
+`name_hint_indicates_gear=True`; the script will run cautious outer-band
+detection, but this should not be used for bearing/ring geometry.
 
 The intended behavior is local refinement only: tooth, flank, root, or detected
 outer gear-band faces use `gear_element_size`; shaft, bore, hub, and non-tooth

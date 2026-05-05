@@ -65,10 +65,11 @@ HyperMesh meshing strategy for this workstation:
     elements still cannot be fixed, keep them in the model and report them; do
     not delete unfixable quality-failed elements unless the user explicitly asks.
 11. Gear, helical gear, or spline teeth are local fine-feature regions. Detect
-    them as repeated radial/tooth-band protrusion faces and mesh those faces
-    smaller; keep shaft and hub faces at the normal base size. If exact tooth
-    surface IDs are not known, auto-detect the outer gear band and refine that
-    band instead of meshing the whole shaft uniformly.
+    them only from true tooth geometry: alternating outer-radius peaks/valleys,
+    repeated tooth flanks, twisted helical tooth faces, or explicit tooth/root
+    surfaces. Do not treat smooth concentric bearing races, annular grooves, or
+    cylindrical outer bands as gears. If exact tooth surface IDs are not known,
+    auto-detect the outer gear band only after gear geometry evidence is present.
 """
 
 GENERIC_MESHING_RULES = {
@@ -124,6 +125,8 @@ GENERIC_MESHING_RULES = {
     "gear_aware_tetra": {
         "use_when": [
             "gear, helical gear, pinion, spline, or many repeated radial/oblique teeth are present",
+            "external tooth evidence is present: alternating outer-radius peaks/valleys, repeated flanks, or twisted tooth faces",
+            "not a smooth bearing/ring with only concentric races or annular grooves",
             "tooth surfaces need a smaller local 2D size than shaft/hub surfaces",
             "the whole part is not safely sweepable as one structured hex block",
         ],
@@ -570,8 +573,13 @@ def classify_hypermesh_part_strategy(
     has_periodic_outer_radius_variation: bool = False,
     has_outer_tooth_band: bool = False,
     has_repeated_tooth_flanks: bool = False,
+    has_alternating_tooth_peaks_and_roots: bool = False,
+    is_smooth_concentric_ring: bool = False,
+    has_bearing_race_grooves: bool = False,
+    has_annular_grooves_only: bool = False,
     tooth_count: int | None = None,
     outer_radius_variation_ratio: float | None = None,
+    name_hint_indicates_gear: bool = False,
     source_faces_can_be_all_quads: bool = False,
     matched_inner_outer_seed_counts: bool = False,
 ) -> dict[str, Any]:
@@ -582,20 +590,44 @@ def classify_hypermesh_part_strategy(
 
     looks_like_flange = is_flange or any(word in text for word in flange_words)
     looks_like_bolted = has_bolt_holes or any(word in text for word in bolt_words)
-    looks_like_gear = (
+    positive_gear_evidence_count = sum(
+        1
+        for flag in (
+            has_gear_teeth,
+            has_helical_teeth,
+            has_twisted_tooth_faces,
+            has_many_repeated_radial_teeth,
+            has_periodic_outer_radius_variation,
+            has_repeated_tooth_flanks,
+            has_alternating_tooth_peaks_and_roots,
+            tooth_count is not None and tooth_count >= 8,
+            outer_radius_variation_ratio is not None and outer_radius_variation_ratio >= 0.04,
+        )
+        if flag
+    )
+    negative_bearing_evidence = (
+        is_smooth_concentric_ring
+        or has_bearing_race_grooves
+        or has_annular_grooves_only
+    )
+    geometry_gear_evidence = (
         has_gear_teeth
         or has_helical_teeth
         or has_twisted_tooth_faces
         or has_many_repeated_radial_teeth
         or has_periodic_outer_radius_variation
-        or has_outer_tooth_band
         or has_repeated_tooth_flanks
+        or has_alternating_tooth_peaks_and_roots
         or (tooth_count is not None and tooth_count >= 8)
         or (
             outer_radius_variation_ratio is not None
             and outer_radius_variation_ratio >= 0.04
             and (tooth_count is None or tooth_count >= 6)
         )
+        or (has_outer_tooth_band and positive_gear_evidence_count >= 1)
+    )
+    looks_like_gear = not negative_bearing_evidence and (
+        geometry_gear_evidence or name_hint_indicates_gear
     )
     stepped_tokens = (
         "step",
@@ -630,6 +662,10 @@ def classify_hypermesh_part_strategy(
                 "tet elements remain in the part's own component",
                 "3D vol skew <= 0.99 after repair/report",
             ],
+            "name_hint_policy": (
+                "A gear-like name is only a low-priority hint to inspect geometry. "
+                "It must not classify the part as gear without tooth geometry evidence."
+            ),
         }
 
     if looks_like_flange or looks_like_bolted:
@@ -953,6 +989,8 @@ def generate_gear_aware_tetra_tcl(
     gear_size_factor: float = 0.45,
     gear_axis: str = "z",
     auto_detect_gear_surfaces: bool = True,
+    geometry_confirms_gear_teeth: bool = False,
+    name_hint_indicates_gear: bool = False,
     gear_outer_band_fraction: float = 0.72,
     output_hm_path: str | None = None,
     min_element_size: float = 0.25,
@@ -1003,6 +1041,8 @@ def generate_gear_aware_tetra_tcl(
         f"set growth_rate {float(growth_rate)}",
         f'set gear_axis "{axis_key}"',
         f"set auto_detect_gear_surfaces {auto_detect}",
+        f"set geometry_confirms_gear_teeth {1 if geometry_confirms_gear_teeth else 0}",
+        f"set name_hint_indicates_gear {1 if name_hint_indicates_gear else 0}",
         f"set gear_outer_band_fraction {float(gear_outer_band_fraction)}",
         f"set gear_surfs {{{gear_ids}}}",
         f"set gear_surface_count {gear_id_count}",
@@ -1085,10 +1125,18 @@ def generate_gear_aware_tetra_tcl(
         "} else {",
         "    *createmark surfs 2 \"by solids\" $target_solid",
         "    set all_surfs [hm_getmark surfs 2]",
-        "    if {$gear_surface_count == 0 && $auto_detect_gear_surfaces} {",
+        "    if {$gear_surface_count == 0 && $auto_detect_gear_surfaces && $geometry_confirms_gear_teeth} {",
         "        set gear_surfs [mcp_auto_gear_surfaces $all_surfs $target_solid $gear_axis $gear_outer_band_fraction]",
         "        set gear_surface_count [llength $gear_surfs]",
         '        puts "MCP gear-aware tetra auto-detected gear_surfs=$gear_surfs count=$gear_surface_count axis=$gear_axis outer_fraction=$gear_outer_band_fraction"',
+        "    }",
+        "    if {$gear_surface_count == 0 && $auto_detect_gear_surfaces && !$geometry_confirms_gear_teeth && $name_hint_indicates_gear} {",
+        '        puts "MCP gear-aware tetra: name hint requests gear inspection, but geometry_confirms_gear_teeth is false; running cautious outer-band detection."',
+        "        set gear_surfs [mcp_auto_gear_surfaces $all_surfs $target_solid $gear_axis $gear_outer_band_fraction]",
+        "        set gear_surface_count [llength $gear_surfs]",
+        "    }",
+        "    if {$gear_surface_count == 0 && $auto_detect_gear_surfaces && !$geometry_confirms_gear_teeth && !$name_hint_indicates_gear} {",
+        '        puts "MCP gear-aware tetra: auto-detect skipped because geometry_confirms_gear_teeth is false; avoiding false gear refinement on smooth bearing/ring geometry."',
         "    }",
         "    if {$gear_surface_count > 0} {",
         "        set base_surfs [mcp_list_subtract $all_surfs $gear_surfs]",
