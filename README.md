@@ -14,6 +14,13 @@ by hard-coded component names from one model.
 Visible GUI mode only changes where Tcl is executed. Strategy selection, Tcl
 generation, and input/output paths remain explicit.
 
+Raw meshing Tcl is guarded by default. `execute_tcl` and `execute_tcl_gui` reject
+direct meshing commands such as `*meshdragelements*`, `*set_meshedgeparams`,
+`*meshspinelements*`, `*defaultmeshsurf_growth`, and `*tetmesh` unless the script
+was produced by one of the MCP strategy generators. This prevents agents from
+bypassing balanced drag seeding, cut-section validation, and gear-local
+refinement rules.
+
 ## Main Tools
 
 - `locate_hypermesh`: find candidate HyperMesh batch and GUI executables.
@@ -85,6 +92,11 @@ Seed policy: if inner/outer preview counts or edge lengths differ greatly, pass
 ratio is at least `seed_balance_ratio_threshold` (default 1.6), the generator
 uses a balanced common count instead of forcing all source edges up to the
 largest outer count.
+
+Do not write naked Tcl with `*set_meshedgeparams` and `*meshdragelements*` for
+drag workflows. The execution tools block that path by default. Use
+`generate_guarded_drag_hex_tcl`; otherwise the balanced seed policy cannot be
+applied.
 
 ### Spin Hex
 
@@ -172,6 +184,11 @@ it falls back to uniform base-size tetra.
 The intended behavior is local refinement only: tooth, flank, root, or detected
 outer gear-band faces use `gear_element_size`; shaft, bore, hub, and non-tooth
 faces keep `base_element_size`.
+
+Do not run a raw uniform `*defaultmeshsurf_growth` + `*tetmesh` script for a part
+whose geometry inspection indicates gear features. The execution tools block raw
+tetra/surface-growth meshing by default; use `generate_gear_aware_tetra_tcl` for
+gear-like geometry so the local tooth-band refinement rule is applied.
 
 ## Known Limitations
 

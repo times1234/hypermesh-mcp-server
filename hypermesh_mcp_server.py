@@ -311,6 +311,74 @@ def _balanced_seed_density(
     return max(4, min(120, int(balanced))), source
 
 
+def _meshing_rule_violation(script: str) -> dict[str, Any] | None:
+    """Reject raw meshing Tcl that bypasses MCP strategy generators."""
+    lowered = script.lower()
+    allowed_markers = (
+        "mcp guarded drag hex",
+        "mcp guarded spin hex",
+        "mcp cut-section spin hex",
+        "mcp gear-aware tetra",
+        "mcp surface deviation r-trias",
+        "mcp surface automesh",
+    )
+    if any(marker in lowered for marker in allowed_markers):
+        return None
+
+    has_drag = "*meshdragelements" in lowered
+    has_spin = "*meshspinelements" in lowered
+    has_tetra = "*tetmesh" in lowered
+    has_surface_growth = "*defaultmeshsurf_growth" in lowered
+    has_direct_seed = "*set_meshedgeparams" in lowered
+
+    if has_drag or has_direct_seed:
+        return {
+            "success": False,
+            "policy_violation": True,
+            "blocked_command": "drag_or_seed",
+            "required_tool": "generate_guarded_drag_hex_tcl",
+            "message": (
+                "Raw Tcl drag/seed commands are blocked because they bypass the "
+                "MCP balanced seed policy. Use generate_guarded_drag_hex_tcl and "
+                "pass preview_edge_seed_counts or source_edge_lengths so large "
+                "inner/outer seed-count gaps are balanced instead of forcing all "
+                "edges to the largest count."
+            ),
+        }
+
+    if has_spin:
+        return {
+            "success": False,
+            "policy_violation": True,
+            "blocked_command": "spin",
+            "required_tool": "generate_guarded_spin_hex_tcl or generate_cutsection_spin_hex_tcl",
+            "message": (
+                "Raw Tcl spin commands are blocked because they bypass MCP section "
+                "validation. Use generate_guarded_spin_hex_tcl for a proven true "
+                "section or generate_cutsection_spin_hex_tcl to cut the solid and "
+                "spin the validated all-quad section."
+            ),
+        }
+
+    if has_tetra or has_surface_growth:
+        return {
+            "success": False,
+            "policy_violation": True,
+            "blocked_command": "tetra_or_surface_growth",
+            "required_tool": "generate_gear_aware_tetra_tcl or generate_surface_deviation_rtrias_tcl",
+            "message": (
+                "Raw Tcl tetra/surface-growth meshing commands are blocked because "
+                "they bypass MCP geometry rules. If geometry inspection shows gear "
+                "features, use generate_gear_aware_tetra_tcl so only tooth/flank/root "
+                "or auto-detected outer gear-band faces are refined and the rest of "
+                "the object keeps the base size. For non-gear geometry, use "
+                "generate_surface_deviation_rtrias_tcl."
+            ),
+        }
+
+    return None
+
+
 def _ensure_runs_dir() -> Path:
     RUNS_DIR.mkdir(exist_ok=True)
     return RUNS_DIR
@@ -1847,10 +1915,16 @@ def execute_tcl(
     hmbatch_path: str | None = None,
     model_path: str | None = None,
     timeout_seconds: int = 120,
+    enforce_meshing_rules: bool = True,
 ) -> dict[str, Any]:
     """Execute a raw HyperMesh Tcl script with hmbatch."""
     if not script.strip():
         raise ValueError("script cannot be empty.")
+    if enforce_meshing_rules:
+        violation = _meshing_rule_violation(script)
+        if violation:
+            violation["execution_mode"] = "batch"
+            return violation
     return _run_hmbatch(
         hmbatch_path=hmbatch_path,
         model_path=model_path,
@@ -1867,10 +1941,16 @@ def execute_tcl_gui(
     model_path: str | None = None,
     output_hm_path: str | None = None,
     timeout_seconds: int = 120,
+    enforce_meshing_rules: bool = True,
 ) -> dict[str, Any]:
     """Execute Tcl inside an already visible HyperMesh GUI listener session."""
     if not script.strip():
         raise ValueError("script cannot be empty.")
+    if enforce_meshing_rules:
+        violation = _meshing_rule_violation(script)
+        if violation:
+            violation["execution_mode"] = "visible_gui"
+            return violation
 
     prefix: list[str] = []
     model = _normalize_path(model_path)
