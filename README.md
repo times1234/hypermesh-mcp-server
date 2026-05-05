@@ -14,19 +14,12 @@ by hard-coded component names from one model.
 Visible GUI mode only changes where Tcl is executed. Strategy selection, Tcl
 generation, and input/output paths remain explicit.
 
-Raw meshing Tcl can be guarded by setting `enforce_meshing_rules=True` on
-`execute_tcl` or `execute_tcl_gui`, but the default is permissive so agents can
-run practical combined Tcl workflows without being forced through a separate
-review step. When enforcement is enabled, direct commands such as
-`*meshdragelements*`, `*set_meshedgeparams`, `*meshspinelements*`,
-`*defaultmeshsurf_growth`, and `*tetmesh` are rejected unless the script was
-produced by one of the MCP strategy generators.
-
-Geometry probes are a special case: they may create temporary coarse shell
-elements only when the script carries MCP probe identity, prints
-`MCP_PROBE_*` lines, and deletes the temporary elements and nodes. Agents can
-also call `run_geometry_probe_gui` or `run_geometry_probe` directly to avoid
-mixing probe execution with final-mesh guards.
+Raw meshing Tcl is guarded by default. `execute_tcl` and `execute_tcl_gui` reject
+direct meshing commands such as `*meshdragelements*`, `*set_meshedgeparams`,
+`*meshspinelements*`, `*defaultmeshsurf_growth`, and `*tetmesh` unless the script
+was produced by one of the MCP strategy generators. This prevents agents from
+bypassing balanced drag seeding, cut-section validation, and gear-local
+refinement rules.
 
 ## Main Tools
 
@@ -34,98 +27,39 @@ mixing probe execution with final-mesh guards.
 - `check_hypermesh_connection`: verify batch startup.
 - `create_gui_listener_tcl`: create a Tcl listener for an already opened GUI.
 - `start_hypermesh_gui_listener`: try to launch visible HyperMesh with the GUI listener.
-- `execute_tcl`: run raw Tcl through batch mode; meshing-rule enforcement is optional.
-- `execute_tcl_gui`: run raw Tcl in the visible GUI listener session; meshing-rule enforcement is optional.
+- `execute_tcl`: run raw Tcl through batch mode.
+- `execute_tcl_gui`: run raw Tcl in the visible GUI listener session.
 - `get_hypermesh_meshing_strategy`: return generic meshing rules and workflows.
 - `get_meshing_rules`: return structured generic tetra/drag/spin rules.
 - `classify_hypermesh_part_strategy`: classify a part by geometry features.
-- `classify_hypermesh_model_parts`: optionally classify supplied solids/components as an advisory table.
-- `generate_geometry_probe_tcl`: create temporary coarse surface meshes to probe pure CAD geometry, then delete them.
-- `run_geometry_probe_gui`: execute the temporary geometry probe directly in the visible GUI listener.
-- `run_geometry_probe`: execute the temporary geometry probe in batch mode.
 - `generate_surface_automesh_tcl`: generate simple surface automesh Tcl.
-- `run_surface_automesh_gui`: run surface automesh in the current GUI session without forced reload/save.
-- `automesh_surfaces_gui`: compatibility wrapper; load/save paths are optional and omitted paths preserve current GUI state.
 - `generate_surface_deviation_rtrias_tcl`: generate surface deviation + R-trias Tcl.
-- `run_surface_deviation_rtrias_gui`: run surface-deviation R-trias in the current GUI session.
-- `generate_batch_tetra_tcl`: generate one tetra script for many solids.
-- `run_batch_tetra_gui`: tetra-mesh many solids in one current-session GUI run.
 - `generate_gear_aware_tetra_tcl`: generate gear/tooth local-refinement tetra Tcl.
 - `generate_guarded_drag_hex_tcl`: generate guarded drag-hex Tcl.
-- `run_guarded_drag_hex_gui`: generate and execute guarded drag-hex in the visible GUI.
 - `generate_guarded_spin_hex_tcl`: generate guarded spin-hex Tcl for a known true section.
-- `run_guarded_spin_hex_gui`: generate and execute guarded spin-hex in the visible GUI.
 - `get_cutsection_spin_workflow`: explain the generic cut-section spin workflow.
 - `generate_cutsection_spin_hex_tcl`: generate cut-section spin Tcl for stepped or recessed revolved solids.
-- `run_cutsection_spin_hex_gui`: generate and execute cut-section spin-hex in the visible GUI.
 
 ## Generic Strategy Rules
 
 Use `classify_hypermesh_part_strategy` and geometry facts, not component names.
 The intended order is:
 
-1. Enumerate all solids/components in the model.
-2. Try visual classification first. If screenshots or visible GUI inspection are
-   enough to identify drag/spin/tetra/gear/bearing/housing behavior, use that
-   judgment and do not run the probe.
-3. If visual inspection is uncertain, or pure CAD Tcl queries cannot return
-   bbox/type/dimension data, run one `generate_geometry_probe_tcl` script for
-   all relevant solids. It temporarily creates a coarse surface mesh, emits
-   `MCP_PROBE_SOLID` lines, and deletes the temporary shell elements and nodes.
-4. If useful, inspect relevant objects and record geometry facts. This is an
-   aid for planning, not a mandatory audit gate.
-5. Optionally run `classify_hypermesh_model_parts` as a lightweight advisory
-   table. Missing expected ids are reported but should not stop meshing.
-6. Use the simplest practical execution path: a combined Tcl script,
-   `execute_tcl_gui`, or one of the `run_*_gui` helpers.
-7. Attempt structured hex candidates first when they are obvious:
-   `drag`, `spin`, and `cut-section spin`.
-8. If a hex candidate fails validation, use tetra fallback or a direct tetra
-   script in the same GUI session.
-9. For bearing/ring-like revolved bodies, do not stop after direct spin fails.
+1. Try the structured hex route that matches the geometry: drag, spin, or
+   cut-section spin.
+2. Validate that real 3D hex elements were created. A leftover 2D section mesh
+   by itself is a failure.
+3. If the hex route fails, clean up temporary/invalid elements and mesh that
+   object with tetra.
+4. For bearing/ring-like revolved bodies, do not stop after direct spin fails.
    Use a real cut plane through the rotation axis, mesh the true radial section,
    and spin that section before tetra fallback.
-
-Names are labels only. Never decide that a part is flange/gear/bearing from the
-component name alone.
-
-Performance rule: avoid adding a separate review/classification phase when the
-visual or Tcl workflow is already clear. Prefer one practical GUI execution over
-many `generate_*` + `execute_tcl_gui` round trips.
-
-### Geometry Probe
-
-Use `generate_geometry_probe_tcl` only as a fallback when visual inspection is
-not enough or CAD-only Tcl geometry queries return empty values. The probe:
-
-- meshes each target solid's surfaces with a coarse temporary 2D mesh
-- reads bbox and simple size/complexity data from the temporary elements
-- prints parseable `MCP_PROBE_SOLID` and `MCP_PROBE_SURFACE` lines
-- returns the same `MCP_PROBE_*` lines through the GUI listener socket response
-- deletes the temporary probe elements and nodes before finishing
-
-Probe output helps infer rough geometry facts such as size ratios, coarse
-complexity, and whether a pure CAD solid can be treated as simple or complex.
-It is not a replacement for final mesh generation and should not be run per
-object when one combined probe script can cover all solids.
-
-If an agent only needs probe data, prefer `run_geometry_probe_gui` in visible
-GUI mode or `run_geometry_probe` in batch mode. These tools execute only the
-probe script and return `probe_lines`, so they do not go through the same
-final-mesh safety gate as raw Tcl. If `generate_geometry_probe_tcl` output is
-sent through `execute_tcl_gui`, keep the generated MCP probe comments and
-`MCP_PROBE_*` lines intact.
-
-For drag source selection on pure CAD, use `MCP_PROBE_SURFACE` lines as the
-source-face candidate table. Choose a likely planar end face whose `flat_axis`
-matches the drag axis and whose center coordinate is at the min or max end of
-the target solid. Do not guess a source surface id from component names.
 
 ### Tetra
 
 Use `tetra_surface_deviation_rtrias` for:
 
-- true geometry flanges or flange-like bodies
+- flanges or flange-like bodies
 - bodies with bolt holes, local holes, bosses, protrusions, ribs, grooves, cutouts, or non-sweepable topology
 - ambiguous parts where a clean drag/spin source cannot be proven
 
@@ -135,22 +69,6 @@ Required checks:
 - clean/check 2D aspect issues
 - tetramesh per component/object
 - check and locally repair/report volume quality
-
-For many tetra-only or tetra-fallback solids, use `run_batch_tetra_gui` instead
-of repeating `generate_gear_aware_tetra_tcl` or `generate_surface_deviation_rtrias_tcl`
-for every solid. It runs one current-session GUI script, meshes each target
-solid, deletes only temporary shell elements, and keeps previously completed
-hex meshes in the model. Omit `model_path` and `output_hm_path` when the model
-is already open and you do not want to reload or overwrite the session.
-
-Flange naming policy:
-
-- A component named `flange` is not automatically a flange.
-- A true flange needs geometric evidence such as a flat annular mounting plate,
-  planar mounting face, and bolt-hole/mounting pattern.
-- Open cages, bearing housings, ribbed supports, and large side-opening bodies
-  should be named by physical role such as `open_housing`, `bearing_housing`, or
-  `ribbed_support`, not `flange`, unless true mounting-flange geometry exists.
 
 ### Drag Hex
 
@@ -176,10 +94,9 @@ uses a balanced common count instead of forcing all source edges up to the
 largest outer count.
 
 Do not write naked Tcl with `*set_meshedgeparams` and `*meshdragelements*` for
-drag workflows when the balanced seed policy matters. Prefer
-`generate_guarded_drag_hex_tcl` or `run_guarded_drag_hex_gui`. Direct Tcl is
-allowed by default for practical workflows; turn on `enforce_meshing_rules=True`
-only when you want the tool to reject naked drag commands.
+drag workflows. The execution tools block that path by default. Use
+`generate_guarded_drag_hex_tcl`; otherwise the balanced seed policy cannot be
+applied.
 
 ### Spin Hex
 
@@ -196,16 +113,8 @@ Pass `solid_id` when possible so the generated mesh can be checked against the
 target solid. Failed fit/non-hex results are cleaned, retried once with the same
 element size, then sent to tetra fallback when enabled.
 
-For pure CAD solids where HyperMesh cannot return a solid bbox, generated hex
-workflows must not accept the result blindly. The guarded generators reject that
-hex candidate, clean temporary elements, and use tetra fallback when enabled.
-
 If the solid is stepped, recessed, grooved, or the source section is ambiguous,
 use cut-section spin instead.
-
-In visible GUI mode, prefer `run_guarded_spin_hex_gui` over generating Tcl and
-sending it through raw `execute_tcl_gui`. The runner executes the trusted
-MCP-generated workflow directly, including its guarded tetra fallback.
 
 ### Cut-Section Spin Hex
 
@@ -220,10 +129,6 @@ Workflow:
 4. Accept only all-quad surfaces whose shell nodes lie on the split plane.
 5. Spin the accepted 2D section shells into 3D hex elements.
 6. Delete only the temporary 2D seed shells.
-
-In visible GUI mode, prefer `run_cutsection_spin_hex_gui` over generating Tcl
-and sending it through raw `execute_tcl_gui`. The runner executes the trusted
-MCP-generated workflow directly, including its guarded tetra fallback.
 
 Required inputs:
 
@@ -297,10 +202,9 @@ outer gear-band faces use `gear_element_size`; shaft, bore, hub, and non-tooth
 faces keep `base_element_size`.
 
 Do not run a raw uniform `*defaultmeshsurf_growth` + `*tetmesh` script for a part
-whose geometry inspection clearly indicates gear features. Prefer
-`generate_gear_aware_tetra_tcl` for gear-like geometry so the local tooth-band
-refinement rule is applied. Direct Tcl execution remains allowed by default for
-practical combined workflows.
+whose geometry inspection indicates gear features. The execution tools block raw
+tetra/surface-growth meshing by default; use `generate_gear_aware_tetra_tcl` for
+gear-like geometry so the local tooth-band refinement rule is applied.
 
 ## Known Limitations
 

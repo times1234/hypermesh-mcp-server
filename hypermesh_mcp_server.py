@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 import socket
@@ -29,11 +29,9 @@ HyperMesh meshing strategy for this workstation:
    mesh type R-trias.
 3. Tetra-volume parts must be meshed per object/component. Do not dump tetra
    elements from several objects into another component.
-4. Flanges are tetra parts, not drag parts, but flange classification must come
-   from geometry, not component names. A flange-like body has mounting-face
-   geometry such as a flat annular plate plus bolt-hole pattern. An open cage,
-   bracket, bearing housing, or ribbed support with large side openings must not
-   be called a flange just because a previous name contains "flange".
+4. Flanges are tetra parts, not drag parts. A flange with bolt holes, stepped
+   lips, bosses, or local cutouts must use surface-deviation R-trias followed
+   by tetramesh, even if part of its outline looks circular.
 5. For tetra strategy: first make 2D surface-deviation R-trias mesh, check/fix
    2D aspect > 10, then generate volume mesh with tetramesh, then check/fix
    volume skew > 0.99.
@@ -61,7 +59,7 @@ HyperMesh meshing strategy for this workstation:
    attempt before tetra; direct surface-id spin is not enough unless the surface
    is already the true radial cross-section.
 9. Component names should describe the physical object, not the mesh type.
-    Examples: housing, shaft_ring, spacer_block_upper, support_flange.
+   Examples: housing, shaft_ring, spacer_block_upper, support_flange.
 10. Do not repair quality by blindly refining the whole mesh. Prefer strategy
     changes, local 3D smoothing/remesh, or sliver-tetra repair. If bad volume
     elements still cannot be fixed, keep them in the model and report them; do
@@ -72,19 +70,12 @@ HyperMesh meshing strategy for this workstation:
     surfaces. Do not treat smooth concentric bearing races, annular grooves, or
     cylindrical outer bands as gears. If exact tooth surface IDs are not known,
     auto-detect the outer gear band only after gear geometry evidence is present.
-12. Planning is advisory, not a mandatory audit gate. When geometry is unclear,
-    classify relevant solids from visual/probe facts before meshing, but do not
-    add a slow separate review phase. Build one practical Tcl script or use a
-    GUI runner when possible. Attempt obvious drag/spin/cut-section-spin hex
-    candidates first; if a hex candidate fails validation, clean its temporary
-    elements and fall back to tetra. Names are allowed only as labels/hints;
-    strategy should come from geometry facts when available.
 """
 
 GENERIC_MESHING_RULES = {
     "tetra_surface_deviation_rtrias": {
         "use_when": [
-            "true geometry flanges or flange-like bodies",
+            "flanges or flange-like bodies",
             "parts with bolt holes, local holes, bosses, protrusions, ribs, grooves, cutouts, or non-sweepable topology",
             "parts whose source face cannot be proven as 100% quads with matched edge seeds",
             "fallback for ambiguous geometry",
@@ -146,17 +137,6 @@ GENERIC_MESHING_RULES = {
             "tetra mesh the solid from the mixed-size surface shell mesh",
         ],
         "fallback": "tetra_surface_deviation_rtrias with uniform base size",
-    },
-    "inspection_required": {
-        "policy": [
-            "enumerate all solids/components before meshing",
-            "run geometry-fact classification once per object",
-            "fail planning if any expected solid/component is missing from the inspection table",
-            "do not choose strategy from component names",
-            "do not execute one HyperMesh call per object; combine generated Tcl blocks when practical",
-            "attempt drag/spin/cut-section-spin candidates before tetra",
-            "queue failed hex candidates for tetra fallback, then run tetra last",
-        ],
     },
 }
 
@@ -298,10 +278,6 @@ def _quote_tcl_path(path: str | os.PathLike[str]) -> str:
     return str(Path(path)).replace("\\", "/").replace('"', '\\"')
 
 
-def _quote_tcl_word(value: str) -> str:
-    return str(value).replace("\\", "\\\\").replace('"', '\\"')
-
-
 def _balanced_seed_density(
     *,
     element_size: float,
@@ -338,57 +314,14 @@ def _balanced_seed_density(
     return max(4, min(120, int(balanced))), source
 
 
-def _is_geometry_probe_script(script: str) -> bool:
-    """Return True for MCP geometry-probe scripts that create only temporary shells."""
-    lowered = script.lower()
-    has_probe_identity = any(
-        token in lowered
-        for token in (
-            "mcp geometry probe",
-            "mcp_probe_begin",
-            "mcp_probe_solid",
-            "mcp_probe_end",
-            "mcp_probe_emit",
-        )
-    )
-    if not has_probe_identity:
-        return False
-
-    has_probe_meshing = "*defaultmeshsurf_growth" in lowered or "*automesh" in lowered
-    deletes_temp_elems = "mcp_delete_elems" in lowered or "*deletemark elems" in lowered
-    deletes_temp_nodes = "mcp_delete_nodes" in lowered or "*deletemark nodes" in lowered
-    has_final_volume_meshing = any(
-        token in lowered
-        for token in (
-            "*meshdragelements",
-            "*meshspinelements",
-            "*tetmesh",
-        )
-    )
-    return (
-        has_probe_meshing
-        and deletes_temp_elems
-        and deletes_temp_nodes
-        and not has_final_volume_meshing
-    )
-
-
 def _meshing_rule_violation(script: str) -> dict[str, Any] | None:
     """Reject raw meshing Tcl that bypasses MCP strategy generators."""
     lowered = script.lower()
-    if _is_geometry_probe_script(script):
-        return None
-
     allowed_markers = (
         "mcp guarded drag hex",
-        "mcp generated guarded drag-hex",
         "mcp guarded spin hex",
-        "mcp generated guarded spin-hex",
         "mcp cut-section spin hex",
-        "mcp generated cut-section spin-hex",
         "mcp gear-aware tetra",
-        "mcp batch tetra",
-        "mcp generated batch tetra",
         "mcp surface deviation r-trias",
         "mcp surface automesh",
     )
@@ -399,7 +332,6 @@ def _meshing_rule_violation(script: str) -> dict[str, Any] | None:
     has_spin = "*meshspinelements" in lowered
     has_tetra = "*tetmesh" in lowered
     has_surface_growth = "*defaultmeshsurf_growth" in lowered
-    has_surface_automesh = "*automesh" in lowered or "*interactiveremeshsurf" in lowered
     has_direct_seed = "*set_meshedgeparams" in lowered
 
     if has_drag or has_direct_seed:
@@ -431,25 +363,19 @@ def _meshing_rule_violation(script: str) -> dict[str, Any] | None:
             ),
         }
 
-    if has_tetra or has_surface_growth or has_surface_automesh:
+    if has_tetra or has_surface_growth:
         return {
             "success": False,
             "policy_violation": True,
             "blocked_command": "tetra_or_surface_growth",
-            "required_tool": (
-                "generate_geometry_probe_tcl/run_geometry_probe_gui for temporary "
-                "geometry probing, or generate_gear_aware_tetra_tcl / "
-                "generate_surface_deviation_rtrias_tcl for final meshing"
-            ),
+            "required_tool": "generate_gear_aware_tetra_tcl or generate_surface_deviation_rtrias_tcl",
             "message": (
                 "Raw Tcl tetra/surface-growth meshing commands are blocked because "
-                "they bypass MCP geometry rules. Temporary geometry probes are allowed "
-                "only when the script has MCP_PROBE/MCP geometry probe identity and "
-                "deletes its temporary shell elements and nodes. If geometry inspection "
-                "shows gear features, use generate_gear_aware_tetra_tcl so only "
-                "tooth/flank/root or auto-detected outer gear-band faces are refined "
-                "and the rest of the object keeps the base size. For non-gear geometry, "
-                "use generate_surface_deviation_rtrias_tcl."
+                "they bypass MCP geometry rules. If geometry inspection shows gear "
+                "features, use generate_gear_aware_tetra_tcl so only tooth/flank/root "
+                "or auto-detected outer gear-band faces are refined and the rest of "
+                "the object keeps the base size. For non-gear geometry, use "
+                "generate_surface_deviation_rtrias_tcl."
             ),
         }
 
@@ -540,67 +466,6 @@ def _run_hypermesh_gui_script(
     }
 
 
-def _extract_probe_lines(text: str) -> list[str]:
-    """Extract parseable geometry-probe lines from HyperMesh stdout/GUI response."""
-    return [
-        line.strip()
-        for line in text.splitlines()
-        if line.strip().startswith(
-            ("MCP_PROBE_BEGIN", "MCP_PROBE_SOLID", "MCP_PROBE_SURFACE", "MCP_PROBE_END")
-        )
-    ]
-
-
-def _execute_generated_gui_script(
-    *,
-    script: str,
-    host: str = "127.0.0.1",
-    port: int = DEFAULT_GUI_PORT,
-    model_path: str | None = None,
-    output_hm_path: str | None = None,
-    timeout_seconds: int = 120,
-    strategy: str,
-) -> dict[str, Any]:
-    """Execute trusted MCP-generated Tcl in the visible GUI listener."""
-    prefix: list[str] = []
-    model = _normalize_path(model_path)
-    if model:
-        if not model.exists():
-            raise FileNotFoundError(f"Model file was not found: {model}")
-        prefix.append(f'*readfile "{_quote_tcl_path(model)}"')
-
-    suffix: list[str] = []
-    if output_hm_path:
-        suffix.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
-
-    gui_script = "\n".join(prefix + [script] + suffix)
-    if not gui_script.endswith("\n"):
-        gui_script += "\n"
-
-    try:
-        result = _run_hypermesh_gui_script(
-            script=gui_script,
-            host=host,
-            port=port,
-            timeout_seconds=timeout_seconds,
-        )
-    except OSError as exc:
-        return {
-            "success": False,
-            "host": host,
-            "port": int(port),
-            "message": (
-                "Could not connect to the visible HyperMesh GUI listener. "
-                "Open HyperMesh and source the Tcl file returned by create_gui_listener_tcl."
-            ),
-            "error": str(exc),
-        }
-
-    result["script"] = script
-    result["strategy"] = strategy
-    return result
-
-
 def _run_hmbatch(
     *,
     hmbatch_path: str | None,
@@ -670,10 +535,6 @@ def get_meshing_rules() -> dict[str, Any]:
         "generic_rules": GENERIC_MESHING_RULES,
         "special_workflows": SPECIAL_WORKFLOWS,
         "notes": [
-            "First try visual/GUI or screenshot-based geometry judgment. If it is enough, do not run the geometry probe.",
-            "If visual judgment is uncertain or pure CAD Tcl geometry queries return no usable bbox/type/size data, run one generate_geometry_probe_tcl script for all relevant solids, then classify from the probe output.",
-            "For visible GUI hex meshing, prefer run_guarded_drag_hex_gui, run_guarded_spin_hex_gui, or run_cutsection_spin_hex_gui instead of sending generated hex Tcl through raw execute_tcl_gui.",
-            "For pure CAD drag source selection, use MCP_PROBE_SURFACE lines from the geometry probe to choose a planar end-face candidate by geometry.",
             "Do not decide tetra/drag/spin by component name.",
             "Classify by geometry: holes/flanges/bosses/cutouts -> tetra; simple constant extrusions with matched quad source face -> drag; clean true cross-section revolved bodies -> spin.",
             "For stepped or recessed revolved solids, use the generic cut-section spin workflow rather than guessed surface-id spin.",
@@ -699,12 +560,6 @@ def classify_hypermesh_part_strategy(
     part_name: str = "",
     description: str = "",
     is_flange: bool = False,
-    is_flat_annular_mounting_plate: bool = False,
-    has_mounting_bolt_pattern: bool = False,
-    has_planar_mounting_face: bool = False,
-    has_open_cage_or_housing_geometry: bool = False,
-    has_large_side_openings: bool = False,
-    has_ribs_or_spokes: bool = False,
     has_bolt_holes: bool = False,
     has_boss_or_protrusion: bool = False,
     is_simple_straight_tube: bool = False,
@@ -729,17 +584,12 @@ def classify_hypermesh_part_strategy(
     matched_inner_outer_seed_counts: bool = False,
 ) -> dict[str, Any]:
     """Classify a part into tetra, drag-hex, or spin-hex strategy."""
-    looks_like_flange = (
-        is_flange
-        or (
-            is_flat_annular_mounting_plate
-            and has_planar_mounting_face
-            and (has_mounting_bolt_pattern or has_bolt_holes)
-            and not has_open_cage_or_housing_geometry
-            and not has_large_side_openings
-        )
-    )
-    looks_like_bolted = has_bolt_holes or has_mounting_bolt_pattern
+    text = f"{part_name} {description}".lower()
+    flange_words = ("flange", "法兰")
+    bolt_words = ("bolt", "hole", "孔", "螺栓", "螺孔")
+
+    looks_like_flange = is_flange or any(word in text for word in flange_words)
+    looks_like_bolted = has_bolt_holes or any(word in text for word in bolt_words)
     positive_gear_evidence_count = sum(
         1
         for flag in (
@@ -779,7 +629,20 @@ def classify_hypermesh_part_strategy(
     looks_like_gear = not negative_bearing_evidence and (
         geometry_gear_evidence or name_hint_indicates_gear
     )
-    looks_stepped_revolved = is_stepped_or_recessed_revolved
+    stepped_tokens = (
+        "step",
+        "stepped",
+        "recess",
+        "recessed",
+        "groove",
+        "grooved",
+        "凹",
+        "台阶",
+        "槽",
+    )
+    looks_stepped_revolved = is_stepped_or_recessed_revolved or (
+        is_clean_revolved_section and any(word in text for word in stepped_tokens)
+    )
 
     if looks_like_gear:
         return {
@@ -805,43 +668,15 @@ def classify_hypermesh_part_strategy(
             ),
         }
 
-    if has_open_cage_or_housing_geometry or has_large_side_openings or has_ribs_or_spokes:
-        return {
-            "success": True,
-            "strategy": "tetra_surface_deviation_rtrias",
-            "recommended_component_name": (
-                "open_housing" if has_open_cage_or_housing_geometry else "ribbed_support"
-            ),
-            "reason": (
-                "Open cage/housing or ribbed support geometry: classify by actual "
-                "large openings, ribs, and support faces, not by any flange-like "
-                "component name. Use per-object tetra unless a separate simple "
-                "sweepable sub-body is proven."
-            ),
-            "required_checks": [
-                "large openings/ribs are geometry evidence for housing/support, not flange naming",
-                "2D aspect <= 10 after cleanup",
-                "3D vol skew <= 0.99 after repair/report",
-                "tet elements remain in the part's own component",
-            ],
-            "name_policy": (
-                "Do not name this part flange unless true flat annular mounting "
-                "geometry is present."
-            ),
-        }
-
     if looks_like_flange or looks_like_bolted:
         return {
             "success": True,
             "strategy": "tetra_surface_deviation_rtrias",
-            "recommended_component_name": "mounting_flange" if looks_like_flange else "bolted_part",
             "reason": (
-                "True flange-like mounting geometry or bolt-hole pattern: use "
-                "surface-deviation R-trias 2D mesh followed by per-component "
-                "tetramesh. Do not drag this part."
+                "Flange or bolted/holed part: use surface-deviation R-trias 2D "
+                "mesh followed by per-component tetramesh. Do not drag this part."
             ),
             "required_checks": [
-                "flange decision comes from flat mounting/bolt geometry, not component name",
                 "2D aspect <= 10 after cleanup",
                 "3D vol skew <= 0.99 after repair",
                 "tet elements remain in the part's own component",
@@ -947,112 +782,6 @@ def classify_hypermesh_part_strategy(
             "2D aspect <= 10 after cleanup",
             "3D vol skew <= 0.99 after repair",
         ],
-    }
-
-
-@mcp.tool()
-def classify_hypermesh_model_parts(
-    expected_part_ids: list[int | str],
-    part_observations: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Return an advisory classification table for supplied solids/components."""
-    if not expected_part_ids:
-        raise ValueError("expected_part_ids cannot be empty.")
-
-    expected = [str(value) for value in expected_part_ids]
-    expected_set = set(expected)
-    allowed_keys = {
-        "part_name",
-        "description",
-        "is_flange",
-        "is_flat_annular_mounting_plate",
-        "has_mounting_bolt_pattern",
-        "has_planar_mounting_face",
-        "has_open_cage_or_housing_geometry",
-        "has_large_side_openings",
-        "has_ribs_or_spokes",
-        "has_bolt_holes",
-        "has_boss_or_protrusion",
-        "is_simple_straight_tube",
-        "is_constant_section_extrusion",
-        "is_clean_revolved_section",
-        "is_stepped_or_recessed_revolved",
-        "has_gear_teeth",
-        "has_helical_teeth",
-        "has_twisted_tooth_faces",
-        "has_many_repeated_radial_teeth",
-        "has_periodic_outer_radius_variation",
-        "has_outer_tooth_band",
-        "has_repeated_tooth_flanks",
-        "has_alternating_tooth_peaks_and_roots",
-        "is_smooth_concentric_ring",
-        "has_bearing_race_grooves",
-        "has_annular_grooves_only",
-        "tooth_count",
-        "outer_radius_variation_ratio",
-        "name_hint_indicates_gear",
-        "source_faces_can_be_all_quads",
-        "matched_inner_outer_seed_counts",
-    }
-
-    seen: set[str] = set()
-    duplicate_ids: list[str] = []
-    unexpected_ids: list[str] = []
-    classifications: list[dict[str, Any]] = []
-    hex_first_part_ids: list[Any] = []
-    tetra_part_ids: list[Any] = []
-
-    for observation in part_observations:
-        if "part_id" not in observation:
-            raise ValueError("Each part observation must include part_id.")
-        part_id = str(observation["part_id"])
-        if part_id in seen:
-            duplicate_ids.append(part_id)
-        seen.add(part_id)
-        if part_id not in expected_set:
-            unexpected_ids.append(part_id)
-
-        kwargs = {key: observation[key] for key in allowed_keys if key in observation}
-        result = classify_hypermesh_part_strategy(**kwargs)
-        result["part_id"] = observation["part_id"]
-        result["inspected"] = True
-        classifications.append(result)
-        if result["strategy"] in {"drag_hex", "spin_hex", "cutsection_spin_hex"}:
-            hex_first_part_ids.append(observation["part_id"])
-        else:
-            tetra_part_ids.append(observation["part_id"])
-
-    missing_ids = [part_id for part_id in expected if part_id not in seen]
-    success = not duplicate_ids and not unexpected_ids
-    return {
-        "success": success,
-        "checked_count": len(seen),
-        "expected_count": len(expected),
-        "missing_part_ids": missing_ids,
-        "duplicate_part_ids": duplicate_ids,
-        "unexpected_part_ids": unexpected_ids,
-        "classifications": classifications,
-        "execution_plan": {
-            "single_gui_execution_preferred": True,
-            "phase_order": [
-                "try_visual_or_gui_geometry_judgment_first",
-                "optionally_probe_uncertain_pure_cad_geometry",
-                "optionally_use_this_advisory_classification_table",
-                "run_the_practical_meshing_script_or_gui_runner",
-            ],
-            "hex_first_part_ids": hex_first_part_ids,
-            "tetra_part_ids": tetra_part_ids,
-            "notes": [
-                "This tool is only a lightweight pre-meshing classification table.",
-                "Missing expected ids are reported for awareness but do not make this tool fail.",
-                "Do not add a separate review/audit step only because this table exists.",
-                "Use visual judgment or a direct Tcl workflow when that is faster and clearer.",
-            ],
-        },
-        "policy": (
-            "This is advisory planning output, not a required audit gate. "
-            "Component names are labels only; prefer geometry facts when available."
-        ),
     }
 
 
@@ -1166,310 +895,6 @@ def check_hypermesh_connection(hmbatch_path: str | None = None) -> dict[str, Any
 
 
 @mcp.tool()
-def generate_geometry_probe_tcl(
-    solid_ids: list[int] | None = None,
-    probe_element_size: float = 5.0,
-    min_element_size: float = 1.0,
-    max_deviation: float = 0.5,
-    max_feature_angle: float = 20.0,
-    growth_rate: float = 1.3,
-    output_hm_path: str | None = None,
-) -> dict[str, Any]:
-    """Generate Tcl that temporarily coarse-meshes CAD solids to infer geometry facts."""
-    if probe_element_size <= 0:
-        raise ValueError("probe_element_size must be greater than 0.")
-    if min_element_size <= 0:
-        raise ValueError("min_element_size must be greater than 0.")
-    if max_deviation < 0:
-        raise ValueError("max_deviation must be non-negative.")
-    if growth_rate <= 0:
-        raise ValueError("growth_rate must be greater than 0.")
-
-    if solid_ids:
-        ids = " ".join(str(int(value)) for value in solid_ids)
-        solid_setup = [f"set target_solids {{{ids}}}"]
-    else:
-        solid_setup = [
-            '*createmark solids 1 "all"',
-            "set target_solids [hm_getmark solids 1]",
-        ]
-
-    max_size = max(float(probe_element_size) * 2.0, float(min_element_size))
-    lines = [
-        "# HyperMesh MCP geometry probe",
-        "# Temporary coarse surface mesh for pure CAD geometry inspection.",
-        "# The probe shells are deleted before this script ends.",
-        f"set probe_size {float(probe_element_size)}",
-        f"set probe_min_size {float(min_element_size)}",
-        f"set probe_max_size {max_size}",
-        f"set probe_max_dev {float(max_deviation)}",
-        f"set probe_feature_angle {float(max_feature_angle)}",
-        f"set probe_growth {float(growth_rate)}",
-        'set ::mcp_probe_output ""',
-        "proc mcp_probe_line {line} {",
-        "    puts $line",
-        "    append ::mcp_probe_output $line \"\\n\"",
-        "}",
-        "proc mcp_mark_count {entity mark_id} {",
-        "    if {[catch {hm_marklength $entity $mark_id} n]} {return 0}",
-        "    return $n",
-        "}",
-        "proc mcp_all_elems {} {",
-        '    *createmark elems 1 "all"',
-        "    return [hm_getmark elems 1]",
-        "}",
-        "proc mcp_all_nodes {} {",
-        '    *createmark nodes 1 "all"',
-        "    return [hm_getmark nodes 1]",
-        "}",
-        "proc mcp_list_subtract {a b} {",
-        "    array set seen {}",
-        "    foreach x $b {set seen($x) 1}",
-        "    set out {}",
-        "    foreach x $a {if {![info exists seen($x)]} {lappend out $x}}",
-        "    return $out",
-        "}",
-        "proc mcp_list_intersect {a b} {",
-        "    array set seen {}",
-        "    foreach x $b {set seen($x) 1}",
-        "    set out {}",
-        "    foreach x $a {if {[info exists seen($x)]} {lappend out $x}}",
-        "    return $out",
-        "}",
-        "proc mcp_delete_elems {elems} {",
-        "    if {[llength $elems] == 0} {return}",
-        "    eval *createmark elems 1 $elems",
-        "    catch {*deletemark elems 1}",
-        "}",
-        "proc mcp_delete_nodes {nodes} {",
-        "    if {[llength $nodes] == 0} {return}",
-        "    eval *createmark nodes 1 $nodes",
-        "    catch {*deletemark nodes 1}",
-        "}",
-        "proc mcp_probe_emit {sid surf_count elems probe_size} {",
-        "    set elem_count [llength $elems]",
-        "    set tri_count 0",
-        "    set quad_count 0",
-        "    set other_count 0",
-        "    array set node_seen {}",
-        "    foreach eid $elems {",
-        "        if {[catch {hm_getvalue elems id=$eid dataname=config} cfg]} {set cfg -1}",
-        "        if {$cfg == 104 || $cfg == 108} {",
-        "            incr quad_count",
-        "        } elseif {$cfg == 103 || $cfg == 106} {",
-        "            incr tri_count",
-        "        } else {",
-        "            incr other_count",
-        "        }",
-        "        if {![catch {hm_getvalue elems id=$eid dataname=nodes} elem_nodes]} {",
-        "            foreach nid $elem_nodes {set node_seen($nid) 1}",
-        "        }",
-        "    }",
-        "    set node_count [array size node_seen]",
-        "    set bbox_ok 0",
-        "    set dx 0.0; set dy 0.0; set dz 0.0; set diag 0.0",
-        "    set bbox {}",
-        "    if {$elem_count > 0} {",
-        "        eval *createmark elems 2 $elems",
-        "        if {![catch {hm_getboundingbox elems 2 0 0 0} bb]} {",
-        "            set bbox_ok 1",
-        "            set bbox $bb",
-        "            set dx [expr {abs([lindex $bb 3] - [lindex $bb 0])}]",
-        "            set dy [expr {abs([lindex $bb 4] - [lindex $bb 1])}]",
-        "            set dz [expr {abs([lindex $bb 5] - [lindex $bb 2])}]",
-        "            set diag [expr {sqrt($dx*$dx + $dy*$dy + $dz*$dz)}]",
-        "        }",
-        "    }",
-        "    set slender 0.0",
-        "    set dims [lsort -real [list $dx $dy $dz]]",
-        "    if {[lindex $dims 0] > 0} {set slender [expr {[lindex $dims 2] / [lindex $dims 0]}]}",
-        "    set complexity 0.0",
-        "    if {$diag > 0} {set complexity [expr {$elem_count / max(1.0, ($diag / $probe_size) * ($diag / $probe_size))}]}",
-        "    mcp_probe_line \"MCP_PROBE_SOLID id=$sid surf_count=$surf_count elem_count=$elem_count node_count=$node_count tri_count=$tri_count quad_count=$quad_count other_count=$other_count bbox_ok=$bbox_ok dx=$dx dy=$dy dz=$dz diag=$diag slender=$slender complexity=$complexity bbox={$bbox}\"",
-        "}",
-        "proc mcp_probe_surface_emit {solid_id surf_id new_elems probe_size} {",
-        "    *createmark elems 3 \"by surface\" $surf_id",
-        "    set surf_elems [mcp_list_intersect [hm_getmark elems 3] $new_elems]",
-        "    set elem_count [llength $surf_elems]",
-        "    if {$elem_count == 0} {",
-        "        mcp_probe_line \"MCP_PROBE_SURFACE solid_id=$solid_id surface_id=$surf_id elem_count=0 bbox_ok=0\"",
-        "        return",
-        "    }",
-        "    eval *createmark elems 3 $surf_elems",
-        "    if {[catch {hm_getboundingbox elems 3 0 0 0} bb]} {",
-        "        mcp_probe_line \"MCP_PROBE_SURFACE solid_id=$solid_id surface_id=$surf_id elem_count=$elem_count bbox_ok=0\"",
-        "        return",
-        "    }",
-        "    set dx [expr {abs([lindex $bb 3] - [lindex $bb 0])}]",
-        "    set dy [expr {abs([lindex $bb 4] - [lindex $bb 1])}]",
-        "    set dz [expr {abs([lindex $bb 5] - [lindex $bb 2])}]",
-        "    set cx [expr {([lindex $bb 0] + [lindex $bb 3]) / 2.0}]",
-        "    set cy [expr {([lindex $bb 1] + [lindex $bb 4]) / 2.0}]",
-        "    set cz [expr {([lindex $bb 2] + [lindex $bb 5]) / 2.0}]",
-        "    set diag [expr {sqrt($dx*$dx + $dy*$dy + $dz*$dz)}]",
-        "    set spans [list $dx $dy $dz]",
-        "    set min_span $dx",
-        "    set flat_axis x",
-        "    if {$dy < $min_span} {set min_span $dy; set flat_axis y}",
-        "    if {$dz < $min_span} {set min_span $dz; set flat_axis z}",
-        "    set flat_ratio 1.0",
-        "    if {$diag > 0} {set flat_ratio [expr {$min_span / $diag}]}",
-        "    set likely_planar [expr {$flat_ratio <= 0.08 || $min_span <= $probe_size * 0.75}]",
-        "    mcp_probe_line \"MCP_PROBE_SURFACE solid_id=$solid_id surface_id=$surf_id elem_count=$elem_count bbox_ok=1 dx=$dx dy=$dy dz=$dz cx=$cx cy=$cy cz=$cz diag=$diag flat_axis=$flat_axis flat_ratio=$flat_ratio likely_planar=$likely_planar bbox={$bb}\"",
-        "}",
-        'catch {*beginhistorystate "MCP geometry probe"}',
-        *solid_setup,
-        'mcp_probe_line "MCP_PROBE_BEGIN solid_count=[llength $target_solids] probe_size=$probe_size"',
-        "foreach sid $target_solids {",
-        "    *createmark solids 1 $sid",
-        "    if {[mcp_mark_count solids 1] == 0} {",
-        '        mcp_probe_line "MCP_PROBE_SOLID id=$sid missing=1"',
-        "        continue",
-        "    }",
-        "    *createmark surfs 1 \"by solids\" $sid",
-        "    set solid_surfs [hm_getmark surfs 1]",
-        "    set surf_count [mcp_mark_count surfs 1]",
-        "    if {$surf_count == 0} {",
-        '        mcp_probe_line "MCP_PROBE_SOLID id=$sid surf_count=0 elem_count=0 bbox_ok=0"',
-        "        continue",
-        "    }",
-        "    set before_elems [mcp_all_elems]",
-        "    set before_nodes [mcp_all_nodes]",
-        "    *createarray 3 0 0 0",
-        "    if {[catch {*defaultmeshsurf_growth 1 $probe_size 3 3 2 1 1 1 35 0 $probe_min_size $probe_max_size $probe_max_dev $probe_feature_angle $probe_growth 1 3 1 0} mesh_err]} {",
-        '        mcp_probe_line "MCP_PROBE_SOLID id=$sid surf_count=$surf_count elem_count=0 bbox_ok=0 mesh_error={$mesh_err}"',
-        "        continue",
-        "    }",
-        "    set new_elems [mcp_list_subtract [mcp_all_elems] $before_elems]",
-        "    set new_nodes [mcp_list_subtract [mcp_all_nodes] $before_nodes]",
-        "    mcp_probe_emit $sid $surf_count $new_elems $probe_size",
-        "    foreach probe_surf $solid_surfs {mcp_probe_surface_emit $sid $probe_surf $new_elems $probe_size}",
-        "    mcp_delete_elems $new_elems",
-        "    mcp_delete_nodes $new_nodes",
-        "}",
-        'mcp_probe_line "MCP_PROBE_END"',
-        'catch {*endhistorystate "MCP geometry probe"}',
-    ]
-    if output_hm_path:
-        lines.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
-    lines.append("set ::mcp_probe_output")
-
-    return {
-        "success": True,
-        "script": "\n".join(lines) + "\n",
-        "strategy": (
-            "Visual classification remains the first choice. Use this probe only "
-            "when screenshots/visual inspection are not enough or pure CAD Tcl "
-            "geometry queries return no size/type data. The probe creates temporary "
-            "coarse surface shells, emits MCP_PROBE_SOLID lines, and deletes the "
-            "temporary shell elements and nodes."
-        ),
-    }
-
-
-@mcp.tool()
-def run_geometry_probe_gui(
-    solid_ids: list[int] | None = None,
-    probe_element_size: float = 5.0,
-    min_element_size: float = 1.0,
-    max_deviation: float = 0.5,
-    max_feature_angle: float = 20.0,
-    growth_rate: float = 1.3,
-    host: str = "127.0.0.1",
-    port: int = DEFAULT_GUI_PORT,
-    model_path: str | None = None,
-    timeout_seconds: int = 120,
-) -> dict[str, Any]:
-    """Run the temporary geometry probe directly in the visible GUI listener."""
-    generated = generate_geometry_probe_tcl(
-        solid_ids=solid_ids,
-        probe_element_size=probe_element_size,
-        min_element_size=min_element_size,
-        max_deviation=max_deviation,
-        max_feature_angle=max_feature_angle,
-        growth_rate=growth_rate,
-    )
-    script = generated["script"]
-
-    prefix: list[str] = []
-    model = _normalize_path(model_path)
-    if model:
-        if not model.exists():
-            raise FileNotFoundError(f"Model file was not found: {model}")
-        prefix.append(f'*readfile "{_quote_tcl_path(model)}"')
-    gui_script = "\n".join(prefix + [script])
-    if not gui_script.endswith("\n"):
-        gui_script += "\n"
-
-    try:
-        result = _run_hypermesh_gui_script(
-            script=gui_script,
-            host=host,
-            port=port,
-            timeout_seconds=timeout_seconds,
-        )
-    except OSError as exc:
-        return {
-            "success": False,
-            "host": host,
-            "port": int(port),
-            "message": (
-                "Could not connect to the visible HyperMesh GUI listener. "
-                "Open HyperMesh and source the Tcl file returned by create_gui_listener_tcl."
-            ),
-            "error": str(exc),
-        }
-
-    result["probe_lines"] = _extract_probe_lines(result.get("response", ""))
-    result["script"] = script
-    result["strategy"] = (
-        "This tool intentionally bypasses final-meshing policy checks because it "
-        "runs only an MCP geometry probe: temporary coarse shells are created, "
-        "reported, and deleted before the script ends."
-    )
-    return result
-
-
-@mcp.tool()
-def run_geometry_probe(
-    input_hm_path: str,
-    solid_ids: list[int] | None = None,
-    probe_element_size: float = 5.0,
-    min_element_size: float = 1.0,
-    max_deviation: float = 0.5,
-    max_feature_angle: float = 20.0,
-    growth_rate: float = 1.3,
-    hmbatch_path: str | None = None,
-    timeout_seconds: int = 120,
-) -> dict[str, Any]:
-    """Run the temporary geometry probe in hmbatch without final-mesh policy checks."""
-    generated = generate_geometry_probe_tcl(
-        solid_ids=solid_ids,
-        probe_element_size=probe_element_size,
-        min_element_size=min_element_size,
-        max_deviation=max_deviation,
-        max_feature_angle=max_feature_angle,
-        growth_rate=growth_rate,
-    )
-    result = _run_hmbatch(
-        hmbatch_path=hmbatch_path,
-        model_path=input_hm_path,
-        script=generated["script"],
-        timeout_seconds=timeout_seconds,
-    )
-    result["probe_lines"] = _extract_probe_lines(
-        "\n".join([result.get("stdout", ""), result.get("stderr", "")])
-    )
-    result["script"] = generated["script"]
-    result["strategy"] = (
-        "This tool intentionally bypasses final-meshing policy checks because it "
-        "runs only an MCP geometry probe: temporary coarse shells are created, "
-        "reported, and deleted before the script ends."
-    )
-    return result
-
-
-@mcp.tool()
 def generate_surface_automesh_tcl(
     element_size: float,
     surface_ids: list[int] | None = None,
@@ -1552,261 +977,6 @@ def generate_surface_deviation_rtrias_tcl(
         "script": "\n".join(lines) + "\n",
         "strategy": HYPERMESH_MESHING_STRATEGY.strip(),
     }
-
-
-@mcp.tool()
-def run_surface_automesh_gui(
-    element_size: float,
-    surface_ids: list[int] | None = None,
-    host: str = "127.0.0.1",
-    port: int = DEFAULT_GUI_PORT,
-    model_path: str | None = None,
-    output_hm_path: str | None = None,
-    timeout_seconds: int = 180,
-) -> dict[str, Any]:
-    """Run surface automesh in the current visible GUI session without forced reload/save."""
-    generated = generate_surface_automesh_tcl(
-        element_size=element_size,
-        surface_ids=surface_ids,
-    )
-    return _execute_generated_gui_script(
-        script=generated["script"],
-        host=host,
-        port=port,
-        model_path=model_path,
-        output_hm_path=output_hm_path,
-        timeout_seconds=timeout_seconds,
-        strategy=(
-            "Current-session surface automesh. model_path/output_hm_path are optional; "
-            "omit them to avoid reloading the model or overwriting existing hex meshes."
-        ),
-    )
-
-
-@mcp.tool()
-def run_surface_deviation_rtrias_gui(
-    element_size: float,
-    surface_ids: list[int] | None = None,
-    min_element_size: float = 0.5,
-    max_deviation: float = 0.1,
-    max_feature_angle: float = 15.0,
-    growth_rate: float = 1.23,
-    host: str = "127.0.0.1",
-    port: int = DEFAULT_GUI_PORT,
-    model_path: str | None = None,
-    output_hm_path: str | None = None,
-    timeout_seconds: int = 180,
-) -> dict[str, Any]:
-    """Run surface-deviation R-trias in the current visible GUI session."""
-    generated = generate_surface_deviation_rtrias_tcl(
-        element_size=element_size,
-        surface_ids=surface_ids,
-        min_element_size=min_element_size,
-        max_deviation=max_deviation,
-        max_feature_angle=max_feature_angle,
-        growth_rate=growth_rate,
-    )
-    return _execute_generated_gui_script(
-        script=generated["script"],
-        host=host,
-        port=port,
-        model_path=model_path,
-        output_hm_path=output_hm_path,
-        timeout_seconds=timeout_seconds,
-        strategy=(
-            "Current-session surface-deviation R-trias. model_path/output_hm_path "
-            "are optional; omit them to keep existing GUI mesh state."
-        ),
-    )
-
-
-@mcp.tool()
-def generate_batch_tetra_tcl(
-    solid_ids: list[int],
-    element_size: float,
-    component_names: list[str] | None = None,
-    component_prefix: str = "tetra_solid",
-    output_hm_path: str | None = None,
-    delete_existing_component_elements: bool = True,
-    min_element_size: float = 0.5,
-    max_deviation: float = 0.1,
-    max_feature_angle: float = 15.0,
-    growth_rate: float = 1.23,
-) -> dict[str, Any]:
-    """Generate one Tcl script that tetra-meshes many solids in the current model."""
-    if not solid_ids:
-        raise ValueError("solid_ids cannot be empty.")
-    if element_size <= 0:
-        raise ValueError("element_size must be greater than 0.")
-    if min_element_size <= 0:
-        raise ValueError("min_element_size must be greater than 0.")
-    if max_deviation < 0:
-        raise ValueError("max_deviation must be non-negative.")
-    if growth_rate <= 0:
-        raise ValueError("growth_rate must be greater than 0.")
-    if component_names is not None and len(component_names) != len(solid_ids):
-        raise ValueError("component_names must match solid_ids length when supplied.")
-
-    ids = " ".join(str(int(value)) for value in solid_ids)
-    if component_names is None:
-        names = [f"{component_prefix}_{int(sid)}" for sid in solid_ids]
-    else:
-        names = [str(name) if str(name).strip() else f"{component_prefix}_{int(sid)}" for name, sid in zip(component_names, solid_ids)]
-    name_list = " ".join(f'"{_quote_tcl_word(name)}"' for name in names)
-    max_element_size = max(float(element_size) * 1.8, float(min_element_size))
-    delete_existing = "1" if delete_existing_component_elements else "0"
-    lines = [
-        "# HyperMesh MCP generated batch tetra script",
-        "# Meshes multiple solids in one GUI/batch execution; no per-solid execute loop is needed.",
-        'catch {*beginhistorystate "MCP batch tetra"}',
-        f"set batch_tetra_solids {{{ids}}}",
-        f"set batch_tetra_components {{{name_list}}}",
-        f"set elem_size {float(element_size)}",
-        f"set min_size {float(min_element_size)}",
-        f"set max_size {max_element_size}",
-        f"set max_dev {float(max_deviation)}",
-        f"set feature_angle {float(max_feature_angle)}",
-        f"set growth_rate {float(growth_rate)}",
-        f"set delete_existing_component_elements {delete_existing}",
-        "proc mcp_all_elems {} {",
-        '    *createmark elems 1 "all"',
-        "    return [hm_getmark elems 1]",
-        "}",
-        "proc mcp_list_subtract {a b} {",
-        "    array set seen {}",
-        "    foreach x $b {set seen($x) 1}",
-        "    set out {}",
-        "    foreach x $a {if {![info exists seen($x)]} {lappend out $x}}",
-        "    return $out",
-        "}",
-        "proc mcp_mark_count {entity mark_id} {",
-        "    if {[catch {hm_marklength $entity $mark_id} n]} {return 0}",
-        "    return $n",
-        "}",
-        "proc mcp_delete_elems {elems} {",
-        "    if {[llength $elems] == 0} {return}",
-        "    eval *createmark elems 1 $elems",
-        "    catch {*deletemark elems 1}",
-        "}",
-        "proc mcp_batch_tetra_one {solid_id comp elem_size min_size max_size max_dev feature_angle growth_rate} {",
-        '    puts "MCP_BATCH_TETRA_START solid=$solid_id comp=$comp"',
-        "    *currentcollector components $comp",
-        "    if {$::mcp_delete_existing_component_elements} {",
-        '        *createmark elems 1 "by comp name" $comp',
-        "        if {[mcp_mark_count elems 1] > 0} {catch {*deletemark elems 1}}",
-        "    }",
-        "    *createmark solids 2 $solid_id",
-        "    if {[mcp_mark_count solids 2] == 0} {",
-        '        puts "MCP_BATCH_TETRA_RESULT solid=$solid_id success=0 reason=missing_solid"',
-        "        return 0",
-        "    }",
-        "    *createmark surfs 1 \"by solids\" $solid_id",
-        "    if {[mcp_mark_count surfs 1] == 0} {",
-        '        puts "MCP_BATCH_TETRA_RESULT solid=$solid_id success=0 reason=no_surfaces"',
-        "        return 0",
-        "    }",
-        "    set before_shell_mesh [mcp_all_elems]",
-        "    *createarray 3 0 0 0",
-        "    if {[catch {*defaultmeshsurf_growth 1 $elem_size 3 3 2 1 1 1 35 0 $min_size $max_size $max_dev $feature_angle $growth_rate 1 3 1 0} surf_err]} {",
-        '        puts "MCP_BATCH_TETRA_RESULT solid=$solid_id success=0 reason=surface_mesh_failed error={$surf_err}"',
-        "        return 0",
-        "    }",
-        "    set shell_ids [mcp_list_subtract [mcp_all_elems] $before_shell_mesh]",
-        "    if {[llength $shell_ids] == 0} {",
-        '        puts "MCP_BATCH_TETRA_RESULT solid=$solid_id success=0 reason=no_shells_created"',
-        "        return 0",
-        "    }",
-        "    eval *createmark elems 1 $shell_ids",
-        "    catch {*triangle_clean_up elems 1 \"aspect=10.0 height=0.2\"}",
-        "    set tet_max [expr {max($elem_size * 1.9, 0.85)}]",
-        "    set tet_min $min_size",
-        "    *createstringarray 2 \\",
-        "        \"tet: 547 1.2 2 $tet_max 0.8 $tet_min 0\" \\",
-        "        \"pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew='0.99,0.95,0.90,1'\"",
-        "    if {[catch {*tetmesh elems 1 1 elems 0 -1 1 2} tet_err]} {",
-        '        puts "MCP_BATCH_TETRA_RESULT solid=$solid_id success=0 reason=tetmesh_failed error={$tet_err}"',
-        "        mcp_delete_elems $shell_ids",
-        "        return 0",
-        "    }",
-        "    mcp_delete_elems $shell_ids",
-        '    puts "MCP_BATCH_TETRA_RESULT solid=$solid_id success=1"',
-        "    return 1",
-        "}",
-        "set batch_success 0",
-        "set batch_failed {}",
-        "set ::mcp_delete_existing_component_elements $delete_existing_component_elements",
-        "for {set i 0} {$i < [llength $batch_tetra_solids]} {incr i} {",
-        "    set sid [lindex $batch_tetra_solids $i]",
-        "    set comp [lindex $batch_tetra_components $i]",
-        "    if {[mcp_batch_tetra_one $sid $comp $elem_size $min_size $max_size $max_dev $feature_angle $growth_rate]} {",
-        "        incr batch_success",
-        "    } else {",
-        "        lappend batch_failed $sid",
-        "    }",
-        "}",
-        'puts "MCP_BATCH_TETRA_SUMMARY total=[llength $batch_tetra_solids] success=$batch_success failed=$batch_failed"',
-        'catch {*endhistorystate "MCP batch tetra"}',
-    ]
-    if output_hm_path:
-        lines.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
-
-    return {
-        "success": True,
-        "script": "\n".join(lines) + "\n",
-        "strategy": (
-            "Batch tetra for many solids in one execution. Use this for tetra queues "
-            "instead of repeated generate/execute calls."
-        ),
-    }
-
-
-@mcp.tool()
-def run_batch_tetra_gui(
-    solid_ids: list[int],
-    element_size: float,
-    component_names: list[str] | None = None,
-    component_prefix: str = "tetra_solid",
-    delete_existing_component_elements: bool = True,
-    min_element_size: float = 0.5,
-    max_deviation: float = 0.1,
-    max_feature_angle: float = 15.0,
-    growth_rate: float = 1.23,
-    host: str = "127.0.0.1",
-    port: int = DEFAULT_GUI_PORT,
-    model_path: str | None = None,
-    output_hm_path: str | None = None,
-    timeout_seconds: int = 600,
-) -> dict[str, Any]:
-    """Run one current-session GUI tetra workflow for many solids."""
-    generated = generate_batch_tetra_tcl(
-        solid_ids=solid_ids,
-        element_size=element_size,
-        component_names=component_names,
-        component_prefix=component_prefix,
-        delete_existing_component_elements=delete_existing_component_elements,
-        min_element_size=min_element_size,
-        max_deviation=max_deviation,
-        max_feature_angle=max_feature_angle,
-        growth_rate=growth_rate,
-    )
-    result = _execute_generated_gui_script(
-        script=generated["script"],
-        host=host,
-        port=port,
-        model_path=model_path,
-        output_hm_path=output_hm_path,
-        timeout_seconds=timeout_seconds,
-        strategy=(
-            "Batch tetra GUI runner. Omit model_path/output_hm_path to preserve the "
-            "current GUI session and existing hex meshes."
-        ),
-    )
-    result["batch_tetra_lines"] = [
-        line.strip()
-        for line in result.get("response", "").splitlines()
-        if line.strip().startswith(("MCP_BATCH_TETRA_START", "MCP_BATCH_TETRA_RESULT", "MCP_BATCH_TETRA_SUMMARY"))
-    ]
-    return result
 
 
 @mcp.tool()
@@ -2164,10 +1334,7 @@ def generate_guarded_drag_hex_tcl(
         "    eval *createmark elems 2 $elems",
         "    *createmark solids 2 $solid_id",
         "    if {[catch {hm_getboundingbox elems 2 0 0 0} ebb]} {return 0}",
-        "    if {[catch {hm_getboundingbox solids 2 0 0 0} sbb] || [llength $sbb] < 6} {",
-        '        puts "MCP mesh-solid fit failed: solid bbox unavailable for solid=$solid_id; rejecting hex candidate."',
-        "        return 0",
-        "    }",
+        "    if {[catch {hm_getboundingbox solids 2 0 0 0} sbb]} {return 0}",
         "    set sx [expr {abs([lindex $sbb 3] - [lindex $sbb 0])}]",
         "    set sy [expr {abs([lindex $sbb 4] - [lindex $sbb 1])}]",
         "    set sz [expr {abs([lindex $sbb 5] - [lindex $sbb 2])}]",
@@ -2182,9 +1349,6 @@ def generate_guarded_drag_hex_tcl(
         "    if {$solid_id <= 0} {return 0}",
         '    puts "MCP fallback tetra started for solid=$solid_id comp=$comp"',
         "    *currentcollector components $comp",
-        '    *createmark elems 1 "by comp name" $comp',
-        "    if {[catch {hm_marklength elems 1} existing_count]} {set existing_count 0}",
-        "    if {$existing_count > 0} {catch {*deletemark elems 1}}",
         "    *createmark solids 2 $solid_id",
         "    *createmark surfs 1 \"by solids\" $solid_id",
         "    if {[catch {hm_marklength surfs 1} sc] || $sc == 0} {return 0}",
@@ -2355,10 +1519,7 @@ def generate_guarded_spin_hex_tcl(
         "    eval *createmark elems 2 $elems",
         "    *createmark solids 2 $solid_id",
         "    if {[catch {hm_getboundingbox elems 2 0 0 0} ebb]} {return 0}",
-        "    if {[catch {hm_getboundingbox solids 2 0 0 0} sbb] || [llength $sbb] < 6} {",
-        '        puts "MCP mesh-solid fit failed: solid bbox unavailable for solid=$solid_id; rejecting hex candidate."',
-        "        return 0",
-        "    }",
+        "    if {[catch {hm_getboundingbox solids 2 0 0 0} sbb]} {return 0}",
         "    set sx [expr {abs([lindex $sbb 3] - [lindex $sbb 0])}]",
         "    set sy [expr {abs([lindex $sbb 4] - [lindex $sbb 1])}]",
         "    set sz [expr {abs([lindex $sbb 5] - [lindex $sbb 2])}]",
@@ -2373,9 +1534,6 @@ def generate_guarded_spin_hex_tcl(
         "    if {$solid_id <= 0} {return 0}",
         '    puts "MCP fallback tetra started for solid=$solid_id comp=$comp"',
         "    *currentcollector components $comp",
-        '    *createmark elems 1 "by comp name" $comp',
-        "    if {[catch {hm_marklength elems 1} existing_count]} {set existing_count 0}",
-        "    if {$existing_count > 0} {catch {*deletemark elems 1}}",
         "    *createmark solids 2 $solid_id",
         "    *createmark surfs 1 \"by solids\" $solid_id",
         "    if {[catch {hm_marklength surfs 1} sc] || $sc == 0} {return 0}",
@@ -2613,10 +1771,7 @@ def generate_cutsection_spin_hex_tcl(
         "    *createmark solids 2 $solid_id",
         "    if {[mcp_mark_count elems 2] == 0 || [mcp_mark_count solids 2] == 0} {return 0}",
         "    if {[catch {hm_getboundingbox elems 2 0 0 0} ebb]} {return 0}",
-        "    if {[catch {hm_getboundingbox solids 2 0 0 0} sbb] || [llength $sbb] < 6} {",
-        '        puts "MCP mesh-solid fit failed: solid bbox unavailable for solid=$solid_id; rejecting hex candidate."',
-        "        return 0",
-        "    }",
+        "    if {[catch {hm_getboundingbox solids 2 0 0 0} sbb]} {return 0}",
         "    set sx [expr {abs([lindex $sbb 3] - [lindex $sbb 0])}]",
         "    set sy [expr {abs([lindex $sbb 4] - [lindex $sbb 1])}]",
         "    set sz [expr {abs([lindex $sbb 5] - [lindex $sbb 2])}]",
@@ -2689,30 +1844,17 @@ def generate_cutsection_spin_hex_tcl(
         "    foreach mode_pair $mesh_modes {",
         "        set interactive_mode [lindex $mode_pair 0]",
         "        set face_mode [lindex $mode_pair 1]",
-        "        set before_section_mesh [mcp_all_elems]",
         "        *createmark surfaces 1 $sid",
         "        catch {*setedgedensitylinkwithaspectratio -1}",
         "        *setedgedensitylink 1",
-        "        if {[catch {",
-        "            *interactiveremeshsurf 1 $elem_size $interactive_mode $face_mode 2 1 1",
-        "            *set_meshfaceparams 0 $face_mode 1 0 0 1 0.5 1 1",
-        "            *automesh 0 $face_mode 1",
-        "            *storemeshtodatabase 1",
-        "            *ameshclearsurface",
-        "        } mesh_err]} {",
-        '            puts "MCP cut-section surface automesh failed on surface=$sid face_mode=$face_mode: $mesh_err"',
-        "            catch {*ameshclearsurface}",
-        "            set partial_shells [mcp_list_subtract [mcp_all_elems] $before_section_mesh]",
-        "            mcp_delete_elems $partial_shells",
-        "            continue",
-        "        }",
-        "        set new_section_shells [mcp_list_subtract [mcp_all_elems] $before_section_mesh]",
+        "        *interactiveremeshsurf 1 $elem_size $interactive_mode $face_mode 2 1 1",
+        "        *set_meshfaceparams 0 $face_mode 1 0 0 1 0.5 1 1",
+        "        *automesh 0 $face_mode 1",
+        "        *storemeshtodatabase 1",
+        "        *ameshclearsurface",
         '        *createmark elems 1 "by surface" $sid',
         "        set shells [hm_getmark elems 1]",
-        "        if {[llength $shells] == 0} {",
-        "            mcp_delete_elems $new_section_shells",
-        "            continue",
-        "        }",
+        "        if {[llength $shells] == 0} {continue}",
         "        set quads 0",
         "        set maxdist 0.0",
         "        foreach eid $shells {",
@@ -2725,11 +1867,9 @@ def generate_cutsection_spin_hex_tcl(
         "        }",
         "        if {$quads == [llength $shells] && $maxdist <= $plane_tol} {",
         '            puts "MCP accepted true section surface=$sid mesh_mode=$face_mode shells=[llength $shells] maxdist=$maxdist plane_tol=$plane_tol"',
-        "            set extra_shells [mcp_list_subtract $new_section_shells $shells]",
-        "            mcp_delete_elems $extra_shells",
         "            return $shells",
         "        }",
-        "        mcp_delete_elems $new_section_shells",
+        "        mcp_delete_elems $shells",
         "    }",
         "    return {}",
         "}",
@@ -2818,167 +1958,12 @@ def generate_cutsection_spin_hex_tcl(
 
 
 @mcp.tool()
-def run_guarded_drag_hex_gui(
-    source_surface_id: int,
-    drag_distance: float,
-    element_size: float,
-    component_name: str,
-    axis: str = "z",
-    solid_id: int | None = None,
-    fit_tolerance_ratio: float = 0.05,
-    retry_count: int = 1,
-    fallback_to_tetra: bool = True,
-    layer_count: int | None = None,
-    matched_edge_groups: list[list[int]] | None = None,
-    target_density: int | None = None,
-    preview_edge_seed_counts: list[int] | None = None,
-    source_edge_lengths: list[float] | None = None,
-    seed_balance_ratio_threshold: float = 1.6,
-    host: str = "127.0.0.1",
-    port: int = DEFAULT_GUI_PORT,
-    model_path: str | None = None,
-    output_hm_path: str | None = None,
-    timeout_seconds: int = 180,
-) -> dict[str, Any]:
-    """Generate and execute guarded drag-hex Tcl directly in the visible GUI."""
-    generated = generate_guarded_drag_hex_tcl(
-        source_surface_id=source_surface_id,
-        drag_distance=drag_distance,
-        element_size=element_size,
-        component_name=component_name,
-        axis=axis,
-        solid_id=solid_id,
-        fit_tolerance_ratio=fit_tolerance_ratio,
-        retry_count=retry_count,
-        fallback_to_tetra=fallback_to_tetra,
-        layer_count=layer_count,
-        matched_edge_groups=matched_edge_groups,
-        target_density=target_density,
-        preview_edge_seed_counts=preview_edge_seed_counts,
-        source_edge_lengths=source_edge_lengths,
-        seed_balance_ratio_threshold=seed_balance_ratio_threshold,
-    )
-    return _execute_generated_gui_script(
-        script=generated["script"],
-        host=host,
-        port=port,
-        model_path=model_path,
-        output_hm_path=output_hm_path,
-        timeout_seconds=timeout_seconds,
-        strategy=(
-            "Trusted MCP guarded drag-hex GUI runner. It may contain fallback "
-            "tetra commands, but only inside the generated guarded workflow."
-        ),
-    )
-
-
-@mcp.tool()
-def run_guarded_spin_hex_gui(
-    source_surface_id: int,
-    element_size: float,
-    component_name: str,
-    axis: str = "z",
-    solid_id: int | None = None,
-    fit_tolerance_ratio: float = 0.05,
-    retry_count: int = 1,
-    fallback_to_tetra: bool = True,
-    angle_degrees: float = 360.0,
-    density: int = 96,
-    host: str = "127.0.0.1",
-    port: int = DEFAULT_GUI_PORT,
-    model_path: str | None = None,
-    output_hm_path: str | None = None,
-    timeout_seconds: int = 180,
-) -> dict[str, Any]:
-    """Generate and execute guarded spin-hex Tcl directly in the visible GUI."""
-    generated = generate_guarded_spin_hex_tcl(
-        source_surface_id=source_surface_id,
-        element_size=element_size,
-        component_name=component_name,
-        axis=axis,
-        solid_id=solid_id,
-        fit_tolerance_ratio=fit_tolerance_ratio,
-        retry_count=retry_count,
-        fallback_to_tetra=fallback_to_tetra,
-        angle_degrees=angle_degrees,
-        density=density,
-    )
-    return _execute_generated_gui_script(
-        script=generated["script"],
-        host=host,
-        port=port,
-        model_path=model_path,
-        output_hm_path=output_hm_path,
-        timeout_seconds=timeout_seconds,
-        strategy=(
-            "Trusted MCP guarded spin-hex GUI runner. It may contain fallback "
-            "tetra commands, but only inside the generated guarded workflow."
-        ),
-    )
-
-
-@mcp.tool()
-def run_cutsection_spin_hex_gui(
-    solid_id: int,
-    component_name: str,
-    split_plane_normal: list[float],
-    split_plane_point: list[float],
-    spin_axis: str = "x",
-    spin_axis_point: list[float] | None = None,
-    element_size: float = 0.7,
-    density: int = 96,
-    plane_tolerance: float = 0.02,
-    fit_tolerance_ratio: float = 0.05,
-    retry_count: int = 1,
-    include_existing_section_surfaces: bool = True,
-    allow_quad_only_fallback: bool = True,
-    delete_existing_component_elements: bool = True,
-    fallback_to_tetra: bool = True,
-    host: str = "127.0.0.1",
-    port: int = DEFAULT_GUI_PORT,
-    model_path: str | None = None,
-    output_hm_path: str | None = None,
-    timeout_seconds: int = 240,
-) -> dict[str, Any]:
-    """Generate and execute cut-section spin-hex Tcl directly in the visible GUI."""
-    generated = generate_cutsection_spin_hex_tcl(
-        solid_id=solid_id,
-        component_name=component_name,
-        split_plane_normal=split_plane_normal,
-        split_plane_point=split_plane_point,
-        spin_axis=spin_axis,
-        spin_axis_point=spin_axis_point,
-        element_size=element_size,
-        density=density,
-        plane_tolerance=plane_tolerance,
-        fit_tolerance_ratio=fit_tolerance_ratio,
-        retry_count=retry_count,
-        include_existing_section_surfaces=include_existing_section_surfaces,
-        allow_quad_only_fallback=allow_quad_only_fallback,
-        delete_existing_component_elements=delete_existing_component_elements,
-        fallback_to_tetra=fallback_to_tetra,
-    )
-    return _execute_generated_gui_script(
-        script=generated["script"],
-        host=host,
-        port=port,
-        model_path=model_path,
-        output_hm_path=output_hm_path,
-        timeout_seconds=timeout_seconds,
-        strategy=(
-            "Trusted MCP cut-section spin-hex GUI runner. It may contain fallback "
-            "tetra commands, but only inside the generated guarded workflow."
-        ),
-    )
-
-
-@mcp.tool()
 def execute_tcl(
     script: str,
     hmbatch_path: str | None = None,
     model_path: str | None = None,
     timeout_seconds: int = 120,
-    enforce_meshing_rules: bool = False,
+    enforce_meshing_rules: bool = True,
 ) -> dict[str, Any]:
     """Execute a raw HyperMesh Tcl script with hmbatch."""
     if not script.strip():
@@ -3004,7 +1989,7 @@ def execute_tcl_gui(
     model_path: str | None = None,
     output_hm_path: str | None = None,
     timeout_seconds: int = 120,
-    enforce_meshing_rules: bool = False,
+    enforce_meshing_rules: bool = True,
 ) -> dict[str, Any]:
     """Execute Tcl inside an already visible HyperMesh GUI listener session."""
     if not script.strip():
@@ -3094,26 +2079,28 @@ def automesh_surfaces(
 
 @mcp.tool()
 def automesh_surfaces_gui(
+    input_hm_path: str,
+    output_hm_path: str,
     element_size: float,
-    input_hm_path: str | None = None,
-    output_hm_path: str | None = None,
     surface_ids: list[int] | None = None,
     host: str = "127.0.0.1",
     port: int = DEFAULT_GUI_PORT,
     timeout_seconds: int = 180,
 ) -> dict[str, Any]:
-    """Run surface automesh inside the visible GUI; load/save paths are optional."""
-    result = run_surface_automesh_gui(
+    """Run surface automesh inside the visible HyperMesh GUI and save a new file."""
+    generated = generate_surface_automesh_tcl(
         element_size=element_size,
         surface_ids=surface_ids,
+    )
+    result = execute_tcl_gui(
+        script=generated["script"],
         host=host,
         port=port,
         model_path=input_hm_path,
         output_hm_path=output_hm_path,
         timeout_seconds=timeout_seconds,
     )
-    if output_hm_path:
-        result["output_hm_path"] = output_hm_path
+    result["output_hm_path"] = output_hm_path
     return result
 
 
