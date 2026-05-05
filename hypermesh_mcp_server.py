@@ -318,6 +318,7 @@ def _meshing_rule_violation(script: str) -> dict[str, Any] | None:
     """Reject raw meshing Tcl that bypasses MCP strategy generators."""
     lowered = script.lower()
     allowed_markers = (
+        "mcp geometry probe",
         "mcp guarded drag hex",
         "mcp guarded spin hex",
         "mcp cut-section spin hex",
@@ -515,6 +516,14 @@ def _run_hmbatch(
         }
 
 
+def _extract_probe_lines(text: str) -> list[str]:
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip().startswith(("MCP_PROBE_BEGIN", "MCP_PROBE_SOLID", "MCP_PROBE_END"))
+    ]
+
+
 @mcp.tool()
 def get_hypermesh_meshing_strategy() -> dict[str, Any]:
     """Return the local HyperMesh meshing strategy requested by the user."""
@@ -552,6 +561,265 @@ def get_cutsection_spin_workflow() -> dict[str, Any]:
         "workflow": SPECIAL_WORKFLOWS["cutsection_spin_hex"],
         "gui_mode": SPECIAL_WORKFLOWS["visible_gui_mode"],
         "quality_policy": SPECIAL_WORKFLOWS["quality_policy"],
+    }
+
+
+@mcp.tool()
+def generate_geometry_probe_tcl(
+    solid_ids: list[int] | None = None,
+    probe_element_size: float = 5.0,
+    min_element_size: float = 0.5,
+    max_deviation: float = 0.2,
+    max_feature_angle: float = 20.0,
+    growth_rate: float = 1.3,
+) -> dict[str, Any]:
+    """Generate Tcl that temporarily meshes each solid to report bbox/size facts."""
+    if probe_element_size <= 0:
+        raise ValueError("probe_element_size must be greater than 0.")
+    if min_element_size <= 0:
+        raise ValueError("min_element_size must be greater than 0.")
+    if max_deviation < 0:
+        raise ValueError("max_deviation must be non-negative.")
+
+    if solid_ids:
+        ids = " ".join(str(int(value)) for value in solid_ids)
+        solid_setup = [f"set target_solids {{{ids}}}"]
+    else:
+        solid_setup = [
+            '*createmark solids 1 "all"',
+            "set target_solids [hm_getmark solids 1]",
+        ]
+
+    max_size = max(float(probe_element_size) * 2.0, float(min_element_size))
+    lines = [
+        "# HyperMesh MCP geometry probe",
+        "# Temporary coarse surface mesh for geometry inspection; final mesh is not kept.",
+        f"set probe_size {float(probe_element_size)}",
+        f"set probe_min_size {float(min_element_size)}",
+        f"set probe_max_size {max_size}",
+        f"set probe_max_dev {float(max_deviation)}",
+        f"set probe_feature_angle {float(max_feature_angle)}",
+        f"set probe_growth {float(growth_rate)}",
+        'set ::mcp_probe_output ""',
+        "proc mcp_probe_line {line} {append ::mcp_probe_output $line \"\\n\"}",
+        "proc mcp_mark_count {entity mark_id} {",
+        "    if {[catch {hm_marklength $entity $mark_id} n]} {return 0}",
+        "    return $n",
+        "}",
+        "proc mcp_all_elems {} {",
+        '    *createmark elems 1 "all"',
+        "    return [hm_getmark elems 1]",
+        "}",
+        "proc mcp_all_nodes {} {",
+        '    *createmark nodes 1 "all"',
+        "    return [hm_getmark nodes 1]",
+        "}",
+        "proc mcp_list_subtract {a b} {",
+        "    array set seen {}",
+        "    foreach x $b {set seen($x) 1}",
+        "    set out {}",
+        "    foreach x $a {if {![info exists seen($x)]} {lappend out $x}}",
+        "    return $out",
+        "}",
+        "proc mcp_delete_elems {elems} {",
+        "    if {[llength $elems] == 0} {return}",
+        "    eval *createmark elems 1 $elems",
+        "    catch {*deletemark elems 1}",
+        "}",
+        "proc mcp_delete_nodes {nodes} {",
+        "    if {[llength $nodes] == 0} {return}",
+        "    eval *createmark nodes 1 $nodes",
+        "    catch {*deletemark nodes 1}",
+        "}",
+        *solid_setup,
+        'mcp_probe_line "MCP_PROBE_BEGIN solid_count=[llength $target_solids] probe_size=$probe_size"',
+        "foreach sid $target_solids {",
+        "    set before_elems [mcp_all_elems]",
+        "    set before_nodes [mcp_all_nodes]",
+        "    *createmark solids 1 $sid",
+        "    if {[mcp_mark_count solids 1] == 0} {",
+        '        mcp_probe_line "MCP_PROBE_SOLID id=$sid exists=0"',
+        "        continue",
+        "    }",
+        "    *createmark surfs 1 \"by solids\" $sid",
+        "    set surf_count [mcp_mark_count surfs 1]",
+        "    if {$surf_count == 0} {",
+        '        mcp_probe_line "MCP_PROBE_SOLID id=$sid exists=1 surf_count=0 elem_count=0 bbox_ok=0"',
+        "        continue",
+        "    }",
+        "    set mesh_err \"\"",
+        "    *createarray 3 0 0 0",
+        "    if {[catch {*defaultmeshsurf_growth 1 $probe_size 3 3 2 1 1 1 35 0 $probe_min_size $probe_max_size $probe_max_dev $probe_feature_angle $probe_growth 1 3 1 0} mesh_err]} {",
+        '        mcp_probe_line "MCP_PROBE_SOLID id=$sid exists=1 surf_count=$surf_count elem_count=0 bbox_ok=0 mesh_error={$mesh_err}"',
+        "        set failed_elems [mcp_list_subtract [mcp_all_elems] $before_elems]",
+        "        set failed_nodes [mcp_list_subtract [mcp_all_nodes] $before_nodes]",
+        "        mcp_delete_elems $failed_elems",
+        "        mcp_delete_nodes $failed_nodes",
+        "        continue",
+        "    }",
+        "    set new_elems [mcp_list_subtract [mcp_all_elems] $before_elems]",
+        "    set new_nodes [mcp_list_subtract [mcp_all_nodes] $before_nodes]",
+        "    set tri_count 0",
+        "    set quad_count 0",
+        "    foreach eid $new_elems {",
+        "        if {[catch {hm_getvalue elems id=$eid dataname=config} cfg]} {continue}",
+        "        if {$cfg == 103 || $cfg == 106} {incr tri_count}",
+        "        if {$cfg == 104 || $cfg == 108} {incr quad_count}",
+        "    }",
+        "    set bbox_ok 0",
+        "    set dx 0.0; set dy 0.0; set dz 0.0; set diag 0.0; set slender 0.0",
+        "    if {[llength $new_elems] > 0} {",
+        "        eval *createmark elems 2 $new_elems",
+        "        if {![catch {hm_getboundingbox elems 2 0 0 0} bb] && [llength $bb] >= 6} {",
+        "            set bbox_ok 1",
+        "            set dx [expr {abs([lindex $bb 3] - [lindex $bb 0])}]",
+        "            set dy [expr {abs([lindex $bb 4] - [lindex $bb 1])}]",
+        "            set dz [expr {abs([lindex $bb 5] - [lindex $bb 2])}]",
+        "            set diag [expr {sqrt($dx*$dx + $dy*$dy + $dz*$dz)}]",
+        "            set min_dim [expr {min($dx, min($dy, $dz))}]",
+        "            set max_dim [expr {max($dx, max($dy, $dz))}]",
+        "            if {$min_dim > 0} {set slender [expr {$max_dim / $min_dim}]}",
+        "        }",
+        "    }",
+        '    mcp_probe_line "MCP_PROBE_SOLID id=$sid exists=1 surf_count=$surf_count elem_count=[llength $new_elems] node_count=[llength $new_nodes] tri_count=$tri_count quad_count=$quad_count bbox_ok=$bbox_ok dx=$dx dy=$dy dz=$dz diag=$diag slender=$slender"',
+        "    mcp_delete_elems $new_elems",
+        "    mcp_delete_nodes $new_nodes",
+        "}",
+        'mcp_probe_line "MCP_PROBE_END"',
+        "return $::mcp_probe_output",
+    ]
+    return {
+        "success": True,
+        "script": "\n".join(lines) + "\n",
+        "strategy": "Temporary geometry probe only; generated shells/nodes are deleted before returning.",
+    }
+
+
+@mcp.tool()
+def run_geometry_probe_gui(
+    solid_ids: list[int] | None = None,
+    probe_element_size: float = 5.0,
+    min_element_size: float = 0.5,
+    max_deviation: float = 0.2,
+    max_feature_angle: float = 20.0,
+    growth_rate: float = 1.3,
+    host: str = "127.0.0.1",
+    port: int = DEFAULT_GUI_PORT,
+    timeout_seconds: int = 180,
+) -> dict[str, Any]:
+    """Run the temporary geometry probe in the visible GUI session."""
+    generated = generate_geometry_probe_tcl(
+        solid_ids=solid_ids,
+        probe_element_size=probe_element_size,
+        min_element_size=min_element_size,
+        max_deviation=max_deviation,
+        max_feature_angle=max_feature_angle,
+        growth_rate=growth_rate,
+    )
+    result = execute_tcl_gui(
+        script=generated["script"],
+        host=host,
+        port=port,
+        timeout_seconds=timeout_seconds,
+        enforce_meshing_rules=False,
+    )
+    result["probe_lines"] = _extract_probe_lines(result.get("response", ""))
+    result["script"] = generated["script"]
+    result["strategy"] = generated["strategy"]
+    return result
+
+
+@mcp.tool()
+def recommend_tetra_sizes_from_probe_lines(
+    probe_lines: list[str],
+    base_element_size: float = 4.0,
+    min_element_size: float = 0.6,
+    thin_slender_threshold: float = 8.0,
+    thin_dimension_factor: float = 0.2,
+) -> dict[str, Any]:
+    """Recommend per-solid tetra sizes from MCP_PROBE_SOLID geometry facts."""
+    if base_element_size <= 0:
+        raise ValueError("base_element_size must be greater than 0.")
+    if min_element_size <= 0:
+        raise ValueError("min_element_size must be greater than 0.")
+    if thin_slender_threshold <= 0:
+        raise ValueError("thin_slender_threshold must be greater than 0.")
+    if thin_dimension_factor <= 0:
+        raise ValueError("thin_dimension_factor must be greater than 0.")
+
+    recommendations: list[dict[str, Any]] = []
+    for line in probe_lines:
+        if not line.strip().startswith("MCP_PROBE_SOLID"):
+            continue
+        facts: dict[str, str] = {}
+        for token in line.split()[1:]:
+            if "=" in token:
+                key, value = token.split("=", 1)
+                facts[key] = value
+        try:
+            solid_id = int(facts["id"])
+        except (KeyError, ValueError):
+            continue
+        if facts.get("exists") == "0" or facts.get("bbox_ok") == "0":
+            recommendations.append(
+                {
+                    "solid_id": solid_id,
+                    "strategy": "inspect_manually",
+                    "reason": "Probe could not obtain a usable temporary mesh bbox.",
+                }
+            )
+            continue
+        dims = []
+        for key in ("dx", "dy", "dz"):
+            try:
+                dims.append(float(facts.get(key, "0")))
+            except ValueError:
+                dims.append(0.0)
+        positive_dims = [value for value in dims if value > 0]
+        min_dim = min(positive_dims) if positive_dims else 0.0
+        max_dim = max(positive_dims) if positive_dims else 0.0
+        try:
+            slender = float(facts.get("slender", "0"))
+        except ValueError:
+            slender = 0.0
+        try:
+            surf_count = int(facts.get("surf_count", "0"))
+        except ValueError:
+            surf_count = 0
+
+        size = float(base_element_size)
+        reasons = ["default base size"]
+        is_thin = slender >= thin_slender_threshold
+        is_small_complex = surf_count >= 10 and min_dim > 0 and min_dim < base_element_size * 2.5
+        if min_dim > 0 and (is_thin or is_small_complex or min_dim < base_element_size * 1.5):
+            size = min(size, max(float(min_element_size), min_dim * float(thin_dimension_factor)))
+            reasons = [
+                "thin/small or small-complex feature detected from probe bbox",
+                f"min_dim={min_dim:g}",
+                f"slender={slender:g}",
+                f"surf_count={surf_count}",
+            ]
+        if max_dim > 0 and size > max_dim / 4.0:
+            size = max(float(min_element_size), max_dim / 4.0)
+            reasons.append("limited by max dimension")
+
+        recommendations.append(
+            {
+                "solid_id": solid_id,
+                "strategy": "tetra_surface_deviation_rtrias",
+                "recommended_element_size": round(size, 4),
+                "min_dimension": round(min_dim, 4),
+                "max_dimension": round(max_dim, 4),
+                "slender": round(slender, 4),
+                "surf_count": surf_count,
+                "reason": "; ".join(reasons),
+            }
+        )
+
+    return {
+        "success": True,
+        "count": len(recommendations),
+        "recommendations": recommendations,
     }
 
 
