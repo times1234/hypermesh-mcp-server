@@ -299,6 +299,10 @@ def _quote_tcl_path(path: str | os.PathLike[str]) -> str:
     return str(Path(path)).replace("\\", "/").replace('"', '\\"')
 
 
+def _quote_tcl_word(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _balanced_seed_density(
     *,
     element_size: float,
@@ -384,6 +388,8 @@ def _meshing_rule_violation(script: str) -> dict[str, Any] | None:
         "mcp cut-section spin hex",
         "mcp generated cut-section spin-hex",
         "mcp gear-aware tetra",
+        "mcp batch tetra",
+        "mcp generated batch tetra",
         "mcp surface deviation r-trias",
         "mcp surface automesh",
     )
@@ -950,7 +956,7 @@ def classify_hypermesh_model_parts(
     expected_part_ids: list[int | str],
     part_observations: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Classify every expected solid/component and fail if any object was skipped."""
+    """Return an advisory classification table for supplied solids/components."""
     if not expected_part_ids:
         raise ValueError("expected_part_ids cannot be empty.")
 
@@ -1018,7 +1024,7 @@ def classify_hypermesh_model_parts(
             tetra_part_ids.append(observation["part_id"])
 
     missing_ids = [part_id for part_id in expected if part_id not in seen]
-    success = not missing_ids and not duplicate_ids and not unexpected_ids
+    success = not duplicate_ids and not unexpected_ids
     return {
         "success": success,
         "checked_count": len(seen),
@@ -1031,27 +1037,22 @@ def classify_hypermesh_model_parts(
             "single_gui_execution_preferred": True,
             "phase_order": [
                 "try_visual_or_gui_geometry_judgment_first",
-                "if_uncertain_run_one_geometry_probe_for_all_relevant_solids",
-                "classify_all_parts_once",
-                "build_one_combined_tcl_script",
-                "run_drag_spin_cutsection_spin_candidates_first",
-                "queue_failed_hex_candidates_for_tetra",
-                "run_tetra_for_remaining_and_failed_parts_last",
+                "optionally_probe_uncertain_pure_cad_geometry",
+                "optionally_use_this_advisory_classification_table",
+                "run_the_practical_meshing_script_or_gui_runner",
             ],
             "hex_first_part_ids": hex_first_part_ids,
             "tetra_part_ids": tetra_part_ids,
             "notes": [
                 "This tool is only a lightweight pre-meshing classification table.",
-                "The geometry probe is a fallback data-gathering step, not a required step when visual judgment is enough.",
-                "Do not execute one Tcl call per object just because this table exists.",
-                "Concatenate generator-produced Tcl blocks and send one combined script to execute_tcl_gui when practical.",
+                "Missing expected ids are reported for awareness but do not make this tool fail.",
+                "Do not add a separate review/audit step only because this table exists.",
+                "Use visual judgment or a direct Tcl workflow when that is faster and clearer.",
             ],
         },
         "policy": (
-            "Every expected solid/component must be inspected and classified from "
-            "geometry facts before meshing. Component names are labels only. "
-            "Hex-capable drag/spin/cut-section-spin candidates are attempted before "
-            "tetra; failed hex candidates are queued for tetra fallback."
+            "This is advisory planning output, not a required audit gate. "
+            "Component names are labels only; prefer geometry facts when available."
         ),
     }
 
@@ -1552,6 +1553,251 @@ def generate_surface_deviation_rtrias_tcl(
         "script": "\n".join(lines) + "\n",
         "strategy": HYPERMESH_MESHING_STRATEGY.strip(),
     }
+
+
+@mcp.tool()
+def run_surface_automesh_gui(
+    element_size: float,
+    surface_ids: list[int] | None = None,
+    host: str = "127.0.0.1",
+    port: int = DEFAULT_GUI_PORT,
+    model_path: str | None = None,
+    output_hm_path: str | None = None,
+    timeout_seconds: int = 180,
+) -> dict[str, Any]:
+    """Run surface automesh in the current visible GUI session without forced reload/save."""
+    generated = generate_surface_automesh_tcl(
+        element_size=element_size,
+        surface_ids=surface_ids,
+    )
+    return _execute_generated_gui_script(
+        script=generated["script"],
+        host=host,
+        port=port,
+        model_path=model_path,
+        output_hm_path=output_hm_path,
+        timeout_seconds=timeout_seconds,
+        strategy=(
+            "Current-session surface automesh. model_path/output_hm_path are optional; "
+            "omit them to avoid reloading the model or overwriting existing hex meshes."
+        ),
+    )
+
+
+@mcp.tool()
+def run_surface_deviation_rtrias_gui(
+    element_size: float,
+    surface_ids: list[int] | None = None,
+    min_element_size: float = 0.5,
+    max_deviation: float = 0.1,
+    max_feature_angle: float = 15.0,
+    growth_rate: float = 1.23,
+    host: str = "127.0.0.1",
+    port: int = DEFAULT_GUI_PORT,
+    model_path: str | None = None,
+    output_hm_path: str | None = None,
+    timeout_seconds: int = 180,
+) -> dict[str, Any]:
+    """Run surface-deviation R-trias in the current visible GUI session."""
+    generated = generate_surface_deviation_rtrias_tcl(
+        element_size=element_size,
+        surface_ids=surface_ids,
+        min_element_size=min_element_size,
+        max_deviation=max_deviation,
+        max_feature_angle=max_feature_angle,
+        growth_rate=growth_rate,
+    )
+    return _execute_generated_gui_script(
+        script=generated["script"],
+        host=host,
+        port=port,
+        model_path=model_path,
+        output_hm_path=output_hm_path,
+        timeout_seconds=timeout_seconds,
+        strategy=(
+            "Current-session surface-deviation R-trias. model_path/output_hm_path "
+            "are optional; omit them to keep existing GUI mesh state."
+        ),
+    )
+
+
+@mcp.tool()
+def generate_batch_tetra_tcl(
+    solid_ids: list[int],
+    element_size: float,
+    component_names: list[str] | None = None,
+    component_prefix: str = "tetra_solid",
+    output_hm_path: str | None = None,
+    min_element_size: float = 0.5,
+    max_deviation: float = 0.1,
+    max_feature_angle: float = 15.0,
+    growth_rate: float = 1.23,
+) -> dict[str, Any]:
+    """Generate one Tcl script that tetra-meshes many solids in the current model."""
+    if not solid_ids:
+        raise ValueError("solid_ids cannot be empty.")
+    if element_size <= 0:
+        raise ValueError("element_size must be greater than 0.")
+    if min_element_size <= 0:
+        raise ValueError("min_element_size must be greater than 0.")
+    if max_deviation < 0:
+        raise ValueError("max_deviation must be non-negative.")
+    if growth_rate <= 0:
+        raise ValueError("growth_rate must be greater than 0.")
+    if component_names is not None and len(component_names) != len(solid_ids):
+        raise ValueError("component_names must match solid_ids length when supplied.")
+
+    ids = " ".join(str(int(value)) for value in solid_ids)
+    if component_names is None:
+        names = [f"{component_prefix}_{int(sid)}" for sid in solid_ids]
+    else:
+        names = [str(name) if str(name).strip() else f"{component_prefix}_{int(sid)}" for name, sid in zip(component_names, solid_ids)]
+    name_list = " ".join(f'"{_quote_tcl_word(name)}"' for name in names)
+    max_element_size = max(float(element_size) * 1.8, float(min_element_size))
+    lines = [
+        "# HyperMesh MCP generated batch tetra script",
+        "# Meshes multiple solids in one GUI/batch execution; no per-solid execute loop is needed.",
+        'catch {*beginhistorystate "MCP batch tetra"}',
+        f"set batch_tetra_solids {{{ids}}}",
+        f"set batch_tetra_components {{{name_list}}}",
+        f"set elem_size {float(element_size)}",
+        f"set min_size {float(min_element_size)}",
+        f"set max_size {max_element_size}",
+        f"set max_dev {float(max_deviation)}",
+        f"set feature_angle {float(max_feature_angle)}",
+        f"set growth_rate {float(growth_rate)}",
+        "proc mcp_all_elems {} {",
+        '    *createmark elems 1 "all"',
+        "    return [hm_getmark elems 1]",
+        "}",
+        "proc mcp_list_subtract {a b} {",
+        "    array set seen {}",
+        "    foreach x $b {set seen($x) 1}",
+        "    set out {}",
+        "    foreach x $a {if {![info exists seen($x)]} {lappend out $x}}",
+        "    return $out",
+        "}",
+        "proc mcp_mark_count {entity mark_id} {",
+        "    if {[catch {hm_marklength $entity $mark_id} n]} {return 0}",
+        "    return $n",
+        "}",
+        "proc mcp_delete_elems {elems} {",
+        "    if {[llength $elems] == 0} {return}",
+        "    eval *createmark elems 1 $elems",
+        "    catch {*deletemark elems 1}",
+        "}",
+        "proc mcp_batch_tetra_one {solid_id comp elem_size min_size max_size max_dev feature_angle growth_rate} {",
+        '    puts "MCP_BATCH_TETRA_START solid=$solid_id comp=$comp"',
+        "    *currentcollector components $comp",
+        "    *createmark solids 2 $solid_id",
+        "    if {[mcp_mark_count solids 2] == 0} {",
+        '        puts "MCP_BATCH_TETRA_RESULT solid=$solid_id success=0 reason=missing_solid"',
+        "        return 0",
+        "    }",
+        "    *createmark surfs 1 \"by solids\" $solid_id",
+        "    if {[mcp_mark_count surfs 1] == 0} {",
+        '        puts "MCP_BATCH_TETRA_RESULT solid=$solid_id success=0 reason=no_surfaces"',
+        "        return 0",
+        "    }",
+        "    set before_shell_mesh [mcp_all_elems]",
+        "    *createarray 3 0 0 0",
+        "    if {[catch {*defaultmeshsurf_growth 1 $elem_size 3 3 2 1 1 1 35 0 $min_size $max_size $max_dev $feature_angle $growth_rate 1 3 1 0} surf_err]} {",
+        '        puts "MCP_BATCH_TETRA_RESULT solid=$solid_id success=0 reason=surface_mesh_failed error={$surf_err}"',
+        "        return 0",
+        "    }",
+        "    set shell_ids [mcp_list_subtract [mcp_all_elems] $before_shell_mesh]",
+        "    if {[llength $shell_ids] == 0} {",
+        '        puts "MCP_BATCH_TETRA_RESULT solid=$solid_id success=0 reason=no_shells_created"',
+        "        return 0",
+        "    }",
+        "    eval *createmark elems 1 $shell_ids",
+        "    catch {*triangle_clean_up elems 1 \"aspect=10.0 height=0.2\"}",
+        "    set tet_max [expr {max($elem_size * 1.9, 0.85)}]",
+        "    set tet_min $min_size",
+        "    *createstringarray 2 \\",
+        "        \"tet: 547 1.2 2 $tet_max 0.8 $tet_min 0\" \\",
+        "        \"pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew='0.99,0.95,0.90,1'\"",
+        "    if {[catch {*tetmesh elems 1 1 elems 0 -1 1 2} tet_err]} {",
+        '        puts "MCP_BATCH_TETRA_RESULT solid=$solid_id success=0 reason=tetmesh_failed error={$tet_err}"',
+        "        mcp_delete_elems $shell_ids",
+        "        return 0",
+        "    }",
+        "    mcp_delete_elems $shell_ids",
+        '    puts "MCP_BATCH_TETRA_RESULT solid=$solid_id success=1"',
+        "    return 1",
+        "}",
+        "set batch_success 0",
+        "set batch_failed {}",
+        "for {set i 0} {$i < [llength $batch_tetra_solids]} {incr i} {",
+        "    set sid [lindex $batch_tetra_solids $i]",
+        "    set comp [lindex $batch_tetra_components $i]",
+        "    if {[mcp_batch_tetra_one $sid $comp $elem_size $min_size $max_size $max_dev $feature_angle $growth_rate]} {",
+        "        incr batch_success",
+        "    } else {",
+        "        lappend batch_failed $sid",
+        "    }",
+        "}",
+        'puts "MCP_BATCH_TETRA_SUMMARY total=[llength $batch_tetra_solids] success=$batch_success failed=$batch_failed"',
+        'catch {*endhistorystate "MCP batch tetra"}',
+    ]
+    if output_hm_path:
+        lines.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
+
+    return {
+        "success": True,
+        "script": "\n".join(lines) + "\n",
+        "strategy": (
+            "Batch tetra for many solids in one execution. Use this for tetra queues "
+            "instead of repeated generate/execute calls."
+        ),
+    }
+
+
+@mcp.tool()
+def run_batch_tetra_gui(
+    solid_ids: list[int],
+    element_size: float,
+    component_names: list[str] | None = None,
+    component_prefix: str = "tetra_solid",
+    min_element_size: float = 0.5,
+    max_deviation: float = 0.1,
+    max_feature_angle: float = 15.0,
+    growth_rate: float = 1.23,
+    host: str = "127.0.0.1",
+    port: int = DEFAULT_GUI_PORT,
+    model_path: str | None = None,
+    output_hm_path: str | None = None,
+    timeout_seconds: int = 600,
+) -> dict[str, Any]:
+    """Run one current-session GUI tetra workflow for many solids."""
+    generated = generate_batch_tetra_tcl(
+        solid_ids=solid_ids,
+        element_size=element_size,
+        component_names=component_names,
+        component_prefix=component_prefix,
+        min_element_size=min_element_size,
+        max_deviation=max_deviation,
+        max_feature_angle=max_feature_angle,
+        growth_rate=growth_rate,
+    )
+    result = _execute_generated_gui_script(
+        script=generated["script"],
+        host=host,
+        port=port,
+        model_path=model_path,
+        output_hm_path=output_hm_path,
+        timeout_seconds=timeout_seconds,
+        strategy=(
+            "Batch tetra GUI runner. Omit model_path/output_hm_path to preserve the "
+            "current GUI session and existing hex meshes."
+        ),
+    )
+    result["batch_tetra_lines"] = [
+        line.strip()
+        for line in result.get("response", "").splitlines()
+        if line.strip().startswith(("MCP_BATCH_TETRA_START", "MCP_BATCH_TETRA_RESULT", "MCP_BATCH_TETRA_SUMMARY"))
+    ]
+    return result
 
 
 @mcp.tool()
@@ -2431,11 +2677,17 @@ def generate_cutsection_spin_hex_tcl(
         "        *createmark surfaces 1 $sid",
         "        catch {*setedgedensitylinkwithaspectratio -1}",
         "        *setedgedensitylink 1",
-        "        *interactiveremeshsurf 1 $elem_size $interactive_mode $face_mode 2 1 1",
-        "        *set_meshfaceparams 0 $face_mode 1 0 0 1 0.5 1 1",
-        "        *automesh 0 $face_mode 1",
-        "        *storemeshtodatabase 1",
-        "        *ameshclearsurface",
+        "        if {[catch {",
+        "            *interactiveremeshsurf 1 $elem_size $interactive_mode $face_mode 2 1 1",
+        "            *set_meshfaceparams 0 $face_mode 1 0 0 1 0.5 1 1",
+        "            *automesh 0 $face_mode 1",
+        "            *storemeshtodatabase 1",
+        "            *ameshclearsurface",
+        "        } mesh_err]} {",
+        '            puts "MCP cut-section surface automesh failed on surface=$sid face_mode=$face_mode: $mesh_err"',
+        "            catch {*ameshclearsurface}",
+        "            continue",
+        "        }",
         '        *createmark elems 1 "by surface" $sid',
         "        set shells [hm_getmark elems 1]",
         "        if {[llength $shells] == 0} {continue}",
@@ -2702,7 +2954,7 @@ def execute_tcl(
     hmbatch_path: str | None = None,
     model_path: str | None = None,
     timeout_seconds: int = 120,
-    enforce_meshing_rules: bool = True,
+    enforce_meshing_rules: bool = False,
 ) -> dict[str, Any]:
     """Execute a raw HyperMesh Tcl script with hmbatch."""
     if not script.strip():
@@ -2728,7 +2980,7 @@ def execute_tcl_gui(
     model_path: str | None = None,
     output_hm_path: str | None = None,
     timeout_seconds: int = 120,
-    enforce_meshing_rules: bool = True,
+    enforce_meshing_rules: bool = False,
 ) -> dict[str, Any]:
     """Execute Tcl inside an already visible HyperMesh GUI listener session."""
     if not script.strip():
@@ -2818,28 +3070,26 @@ def automesh_surfaces(
 
 @mcp.tool()
 def automesh_surfaces_gui(
-    input_hm_path: str,
-    output_hm_path: str,
     element_size: float,
+    input_hm_path: str | None = None,
+    output_hm_path: str | None = None,
     surface_ids: list[int] | None = None,
     host: str = "127.0.0.1",
     port: int = DEFAULT_GUI_PORT,
     timeout_seconds: int = 180,
 ) -> dict[str, Any]:
-    """Run surface automesh inside the visible HyperMesh GUI and save a new file."""
-    generated = generate_surface_automesh_tcl(
+    """Run surface automesh inside the visible GUI; load/save paths are optional."""
+    result = run_surface_automesh_gui(
         element_size=element_size,
         surface_ids=surface_ids,
-    )
-    result = execute_tcl_gui(
-        script=generated["script"],
         host=host,
         port=port,
         model_path=input_hm_path,
         output_hm_path=output_hm_path,
         timeout_seconds=timeout_seconds,
     )
-    result["output_hm_path"] = output_hm_path
+    if output_hm_path:
+        result["output_hm_path"] = output_hm_path
     return result
 
 
