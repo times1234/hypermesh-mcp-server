@@ -145,9 +145,13 @@ quad-only section mesh mode with the same element size before falling back.
 
 ### Gear-Aware Tetra
 
-Use `classify_hypermesh_part_strategy` with `has_gear_teeth`,
-`has_many_repeated_radial_teeth`, or `tooth_count` when a shaft contains gear,
-pinion, spline, or repeated radial tooth features.
+Use `classify_hypermesh_part_strategy` from geometry facts only. Do not classify
+gear regions from component names, file names, or natural-language labels.
+Set one or more of these when geometry inspection shows a gear-like region:
+`has_gear_teeth`, `has_helical_teeth`, `has_twisted_tooth_faces`,
+`has_many_repeated_radial_teeth`, `has_periodic_outer_radius_variation`,
+`has_outer_tooth_band`, `has_repeated_tooth_flanks`, `tooth_count`, or
+`outer_radius_variation_ratio`.
 
 Then use `generate_gear_aware_tetra_tcl`:
 
@@ -156,10 +160,29 @@ Then use `generate_gear_aware_tetra_tcl`:
 - pass `gear_surface_ids` for repeated tooth, flank, and root surfaces
 - optionally pass `gear_element_size`; otherwise it uses
   `base_element_size * gear_size_factor`
+- pass `gear_axis` (`x`, `y`, or `z`) so automatic tooth-band detection uses
+  the correct shaft axis
 
-If `gear_surface_ids` are not supplied, the script falls back to uniform
-base-size tetra. The MCP should identify tooth-region surfaces by repeated
-radial protrusions/high feature density, not by hard-coded component names.
+If `gear_surface_ids` are not supplied, the script auto-detects the outer gear
+band from surface radii using `gear_outer_band_fraction` and meshes that band
+finer. This is meant to catch helical gears where tooth surfaces are
+oblique/twisted rather than simple radial faces. If auto-detection finds nothing,
+it falls back to uniform base-size tetra.
+
+The intended behavior is local refinement only: tooth, flank, root, or detected
+outer gear-band faces use `gear_element_size`; shaft, bore, hub, and non-tooth
+faces keep `base_element_size`.
+
+## Known Limitations
+
+- Some bearing/ring solids still fall back to tetra even though a human can see
+  they should be sweepable by cutting a radial section and spinning it. The
+  current `generate_cutsection_spin_hex_tcl` requires HyperMesh to expose a
+  usable all-quad true section after `*body_splitmerge_with_plane`; on some
+  recessed bearing geometry it only produces invalid/non-quad sections, so the
+  guarded workflow correctly falls back to tetra. Future work: add a more robust
+  profile extraction path that derives ordered radial profile loops from solid
+  edges instead of relying only on newly split surfaces.
 
 ## Quality Policy
 

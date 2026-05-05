@@ -64,9 +64,11 @@ HyperMesh meshing strategy for this workstation:
     changes, local 3D smoothing/remesh, or sliver-tetra repair. If bad volume
     elements still cannot be fixed, keep them in the model and report them; do
     not delete unfixable quality-failed elements unless the user explicitly asks.
-11. Gear or spline teeth are local fine-feature regions. Detect them as repeated
-    radial tooth/protrusion faces and mesh those faces smaller; keep shaft and
-    hub faces at the normal base size.
+11. Gear, helical gear, or spline teeth are local fine-feature regions. Detect
+    them as repeated radial/tooth-band protrusion faces and mesh those faces
+    smaller; keep shaft and hub faces at the normal base size. If exact tooth
+    surface IDs are not known, auto-detect the outer gear band and refine that
+    band instead of meshing the whole shaft uniformly.
 """
 
 GENERIC_MESHING_RULES = {
@@ -121,12 +123,12 @@ GENERIC_MESHING_RULES = {
     },
     "gear_aware_tetra": {
         "use_when": [
-            "gear, pinion, spline, or many repeated radial teeth are present",
+            "gear, helical gear, pinion, spline, or many repeated radial/oblique teeth are present",
             "tooth surfaces need a smaller local 2D size than shaft/hub surfaces",
             "the whole part is not safely sweepable as one structured hex block",
         ],
         "method": [
-            "identify repeated tooth/flank/root surfaces as the gear region",
+            "identify repeated tooth/flank/root surfaces as the gear region, or auto-detect the outer gear band",
             "surface mesh shaft/hub surfaces with the base size",
             "surface mesh tooth-region surfaces with a smaller gear size",
             "tetra mesh the solid from the mixed-size surface shell mesh",
@@ -494,8 +496,14 @@ def classify_hypermesh_part_strategy(
     is_clean_revolved_section: bool = False,
     is_stepped_or_recessed_revolved: bool = False,
     has_gear_teeth: bool = False,
+    has_helical_teeth: bool = False,
+    has_twisted_tooth_faces: bool = False,
     has_many_repeated_radial_teeth: bool = False,
+    has_periodic_outer_radius_variation: bool = False,
+    has_outer_tooth_band: bool = False,
+    has_repeated_tooth_flanks: bool = False,
     tooth_count: int | None = None,
+    outer_radius_variation_ratio: float | None = None,
     source_faces_can_be_all_quads: bool = False,
     matched_inner_outer_seed_counts: bool = False,
 ) -> dict[str, Any]:
@@ -506,12 +514,20 @@ def classify_hypermesh_part_strategy(
 
     looks_like_flange = is_flange or any(word in text for word in flange_words)
     looks_like_bolted = has_bolt_holes or any(word in text for word in bolt_words)
-    gear_words = ("gear", "pinion", "tooth", "teeth", "spline", "cog")
     looks_like_gear = (
         has_gear_teeth
+        or has_helical_teeth
+        or has_twisted_tooth_faces
         or has_many_repeated_radial_teeth
+        or has_periodic_outer_radius_variation
+        or has_outer_tooth_band
+        or has_repeated_tooth_flanks
         or (tooth_count is not None and tooth_count >= 8)
-        or any(word in text for word in gear_words)
+        or (
+            outer_radius_variation_ratio is not None
+            and outer_radius_variation_ratio >= 0.04
+            and (tooth_count is None or tooth_count >= 6)
+        )
     )
     stepped_tokens = (
         "step",
@@ -533,11 +549,14 @@ def classify_hypermesh_part_strategy(
             "success": True,
             "strategy": "gear_aware_tetra",
             "reason": (
-                "Repeated radial teeth/spline features need local fine surface "
-                "mesh on tooth faces while shaft and hub faces can keep the base size."
+                "Repeated radial or helical teeth/spline features need local fine "
+                "surface mesh on tooth faces while shaft and hub faces can keep "
+                "the base size."
             ),
             "required_checks": [
-                "identify tooth/flank/root surfaces as gear region by repeated radial features",
+                "identify tooth/flank/root surfaces from geometry: periodic outer-radius peaks, repeated flanks, or twisted helical faces",
+                "do not classify gear regions from component names or natural-language labels",
+                "if exact tooth surfaces are unknown, auto-detect the outer gear band from surface radii",
                 "mesh gear-region surfaces with a smaller local element size",
                 "mesh shaft/hub surfaces with the normal base element size",
                 "tet elements remain in the part's own component",
@@ -864,6 +883,9 @@ def generate_gear_aware_tetra_tcl(
     gear_surface_ids: list[int] | None = None,
     gear_element_size: float | None = None,
     gear_size_factor: float = 0.45,
+    gear_axis: str = "z",
+    auto_detect_gear_surfaces: bool = True,
+    gear_outer_band_fraction: float = 0.72,
     output_hm_path: str | None = None,
     min_element_size: float = 0.25,
     max_deviation: float = 0.1,
@@ -880,10 +902,16 @@ def generate_gear_aware_tetra_tcl(
         raise ValueError("gear_size_factor must be greater than 0.")
     if min_element_size <= 0:
         raise ValueError("min_element_size must be greater than 0.")
+    if not 0.0 < gear_outer_band_fraction < 1.0:
+        raise ValueError("gear_outer_band_fraction must be between 0 and 1.")
     if not component_name.strip():
         raise ValueError("component_name cannot be empty.")
+    axis_key = gear_axis.strip().lower()
+    if axis_key not in {"x", "y", "z"}:
+        raise ValueError("gear_axis must be one of: x, y, z.")
 
     comp = component_name.replace('"', '\\"')
+    auto_detect = "1" if auto_detect_gear_surfaces else "0"
     gear_size = float(gear_element_size) if gear_element_size else float(base_element_size) * float(gear_size_factor)
     gear_size = max(float(min_element_size), gear_size)
     base_max_size = max(float(base_element_size) * 1.8, float(min_element_size))
@@ -892,8 +920,8 @@ def generate_gear_aware_tetra_tcl(
     gear_id_count = len(gear_surface_ids or [])
     lines = [
         "# HyperMesh MCP generated gear-aware tetra script",
-        "# Use for gear/pinion/spline shafts: tooth/flank/root surfaces get local fine mesh; shaft/hub surfaces keep base size.",
-        "# Pass gear_surface_ids for the repeated tooth region. If omitted, this falls back to uniform base-size tetra.",
+        "# Use for gear/helical-gear/pinion/spline shafts: tooth/flank/root surfaces get local fine mesh; shaft/hub surfaces keep base size.",
+        "# Pass gear_surface_ids when known. If omitted, this can auto-detect the outer gear band and refine it.",
         f'set target_component "{comp}"',
         f"set target_solid {int(solid_id)}",
         f"set base_size {float(base_element_size)}",
@@ -905,6 +933,9 @@ def generate_gear_aware_tetra_tcl(
         f"set base_feature_angle {float(base_feature_angle)}",
         f"set gear_feature_angle {float(gear_feature_angle)}",
         f"set growth_rate {float(growth_rate)}",
+        f'set gear_axis "{axis_key}"',
+        f"set auto_detect_gear_surfaces {auto_detect}",
+        f"set gear_outer_band_fraction {float(gear_outer_band_fraction)}",
         f"set gear_surfs {{{gear_ids}}}",
         f"set gear_surface_count {gear_id_count}",
         "proc mcp_all_elems {} {",
@@ -932,6 +963,48 @@ def generate_gear_aware_tetra_tcl(
         "    *createarray 3 0 0 0",
         "    *defaultmeshsurf_growth 1 $size 3 3 2 1 1 1 35 0 $::mcp_min_size $max_size $::mcp_max_dev $feature_angle $::mcp_growth_rate 1 3 1 0",
         "}",
+        "proc mcp_radial_from_axis {axis x y z cx cy cz} {",
+        '    if {$axis eq "x"} {return [expr {sqrt(($y-$cy)*($y-$cy) + ($z-$cz)*($z-$cz))}]}',
+        '    if {$axis eq "y"} {return [expr {sqrt(($x-$cx)*($x-$cx) + ($z-$cz)*($z-$cz))}]}',
+        "    return [expr {sqrt(($x-$cx)*($x-$cx) + ($y-$cy)*($y-$cy))}]",
+        "}",
+        "proc mcp_auto_gear_surfaces {surfs solid_id axis outer_fraction} {",
+        "    *createmark solids 2 $solid_id",
+        "    if {[catch {hm_getboundingbox solids 2 0 0 0} sbb]} {return {}}",
+        "    set cx [expr {([lindex $sbb 0] + [lindex $sbb 3]) / 2.0}]",
+        "    set cy [expr {([lindex $sbb 1] + [lindex $sbb 4]) / 2.0}]",
+        "    set cz [expr {([lindex $sbb 2] + [lindex $sbb 5]) / 2.0}]",
+        "    set corners [list \\",
+        "        [list [lindex $sbb 0] [lindex $sbb 1] [lindex $sbb 2]] \\",
+        "        [list [lindex $sbb 0] [lindex $sbb 1] [lindex $sbb 5]] \\",
+        "        [list [lindex $sbb 0] [lindex $sbb 4] [lindex $sbb 2]] \\",
+        "        [list [lindex $sbb 0] [lindex $sbb 4] [lindex $sbb 5]] \\",
+        "        [list [lindex $sbb 3] [lindex $sbb 1] [lindex $sbb 2]] \\",
+        "        [list [lindex $sbb 3] [lindex $sbb 1] [lindex $sbb 5]] \\",
+        "        [list [lindex $sbb 3] [lindex $sbb 4] [lindex $sbb 2]] \\",
+        "        [list [lindex $sbb 3] [lindex $sbb 4] [lindex $sbb 5]]]",
+        "    set solid_rmax 0.0",
+        "    foreach p $corners {",
+        "        set r [mcp_radial_from_axis $axis [lindex $p 0] [lindex $p 1] [lindex $p 2] $cx $cy $cz]",
+        "        if {$r > $solid_rmax} {set solid_rmax $r}",
+        "    }",
+        "    set threshold [expr {$solid_rmax * $outer_fraction}]",
+        "    set out {}",
+        "    foreach sid $surfs {",
+        "        *createmark surfs 2 $sid",
+        "        if {[catch {hm_getboundingbox surfs 2 0 0 0} bb]} {continue}",
+        "        set surf_cx [expr {([lindex $bb 0] + [lindex $bb 3]) / 2.0}]",
+        "        set surf_cy [expr {([lindex $bb 1] + [lindex $bb 4]) / 2.0}]",
+        "        set surf_cz [expr {([lindex $bb 2] + [lindex $bb 5]) / 2.0}]",
+        "        set surf_r [mcp_radial_from_axis $axis $surf_cx $surf_cy $surf_cz $cx $cy $cz]",
+        "        set dx [expr {abs([lindex $bb 3] - [lindex $bb 0])}]",
+        "        set dy [expr {abs([lindex $bb 4] - [lindex $bb 1])}]",
+        "        set dz [expr {abs([lindex $bb 5] - [lindex $bb 2])}]",
+        "        set span_r [expr {sqrt($dx*$dx + $dy*$dy + $dz*$dz) / 2.0}]",
+        "        if {[expr {$surf_r + $span_r}] >= $threshold} {lappend out $sid}",
+        "    }",
+        "    return [lsort -integer -unique $out]",
+        "}",
         'catch {*beginhistorystate "MCP gear-aware tetra"}',
         '*currentcollector components "$target_component"',
         "set ::mcp_min_size $min_size",
@@ -944,6 +1017,11 @@ def generate_gear_aware_tetra_tcl(
         "} else {",
         "    *createmark surfs 2 \"by solids\" $target_solid",
         "    set all_surfs [hm_getmark surfs 2]",
+        "    if {$gear_surface_count == 0 && $auto_detect_gear_surfaces} {",
+        "        set gear_surfs [mcp_auto_gear_surfaces $all_surfs $target_solid $gear_axis $gear_outer_band_fraction]",
+        "        set gear_surface_count [llength $gear_surfs]",
+        '        puts "MCP gear-aware tetra auto-detected gear_surfs=$gear_surfs count=$gear_surface_count axis=$gear_axis outer_fraction=$gear_outer_band_fraction"',
+        "    }",
         "    if {$gear_surface_count > 0} {",
         "        set base_surfs [mcp_list_subtract $all_surfs $gear_surfs]",
         "    } else {",
@@ -986,9 +1064,10 @@ def generate_gear_aware_tetra_tcl(
         "success": True,
         "script": "\n".join(lines) + "\n",
         "strategy": (
-            "Use for gear-like shafts. Identify repeated tooth/flank/root surfaces "
-            "as gear_surface_ids, mesh them with gear_size, and keep shaft/hub "
-            "surfaces at base_size before tetra volume meshing."
+            "Use for gear-like shafts, including helical gears. Identify repeated "
+            "tooth/flank/root surfaces as gear_surface_ids when possible; otherwise "
+            "auto-detect the outer gear band, mesh it with gear_size, and keep "
+            "shaft/hub surfaces at base_size before tetra volume meshing."
         ),
     }
 
