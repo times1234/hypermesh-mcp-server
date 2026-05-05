@@ -339,6 +339,7 @@ def _meshing_rule_violation(script: str) -> dict[str, Any] | None:
     """Reject raw meshing Tcl that bypasses MCP strategy generators."""
     lowered = script.lower()
     allowed_markers = (
+        "mcp geometry probe",
         "mcp guarded drag hex",
         "mcp guarded spin hex",
         "mcp cut-section spin hex",
@@ -556,6 +557,8 @@ def get_meshing_rules() -> dict[str, Any]:
         "generic_rules": GENERIC_MESHING_RULES,
         "special_workflows": SPECIAL_WORKFLOWS,
         "notes": [
+            "First try visual/GUI or screenshot-based geometry judgment. If it is enough, do not run the geometry probe.",
+            "If visual judgment is uncertain or pure CAD Tcl geometry queries return no usable bbox/type/size data, run one generate_geometry_probe_tcl script for all relevant solids, then classify from the probe output.",
             "Do not decide tetra/drag/spin by component name.",
             "Classify by geometry: holes/flanges/bosses/cutouts -> tetra; simple constant extrusions with matched quad source face -> drag; clean true cross-section revolved bodies -> spin.",
             "For stepped or recessed revolved solids, use the generic cut-section spin workflow rather than guessed surface-id spin.",
@@ -917,6 +920,8 @@ def classify_hypermesh_model_parts(
         "execution_plan": {
             "single_gui_execution_preferred": True,
             "phase_order": [
+                "try_visual_or_gui_geometry_judgment_first",
+                "if_uncertain_run_one_geometry_probe_for_all_relevant_solids",
                 "classify_all_parts_once",
                 "build_one_combined_tcl_script",
                 "run_drag_spin_cutsection_spin_candidates_first",
@@ -927,6 +932,7 @@ def classify_hypermesh_model_parts(
             "tetra_part_ids": tetra_part_ids,
             "notes": [
                 "This tool is only a lightweight pre-meshing classification table.",
+                "The geometry probe is a fallback data-gathering step, not a required step when visual judgment is enough.",
                 "Do not execute one Tcl call per object just because this table exists.",
                 "Concatenate generator-produced Tcl blocks and send one combined script to execute_tcl_gui when practical.",
             ],
@@ -1047,6 +1053,163 @@ def check_hypermesh_connection(hmbatch_path: str | None = None) -> dict[str, Any
                 "This can happen when license or GUI startup blocks batch probing."
             ),
         }
+
+
+@mcp.tool()
+def generate_geometry_probe_tcl(
+    solid_ids: list[int] | None = None,
+    probe_element_size: float = 5.0,
+    min_element_size: float = 1.0,
+    max_deviation: float = 0.5,
+    max_feature_angle: float = 20.0,
+    growth_rate: float = 1.3,
+    output_hm_path: str | None = None,
+) -> dict[str, Any]:
+    """Generate Tcl that temporarily coarse-meshes CAD solids to infer geometry facts."""
+    if probe_element_size <= 0:
+        raise ValueError("probe_element_size must be greater than 0.")
+    if min_element_size <= 0:
+        raise ValueError("min_element_size must be greater than 0.")
+    if max_deviation < 0:
+        raise ValueError("max_deviation must be non-negative.")
+    if growth_rate <= 0:
+        raise ValueError("growth_rate must be greater than 0.")
+
+    if solid_ids:
+        ids = " ".join(str(int(value)) for value in solid_ids)
+        solid_setup = [f"set target_solids {{{ids}}}"]
+    else:
+        solid_setup = [
+            '*createmark solids 1 "all"',
+            "set target_solids [hm_getmark solids 1]",
+        ]
+
+    max_size = max(float(probe_element_size) * 2.0, float(min_element_size))
+    lines = [
+        "# HyperMesh MCP geometry probe",
+        "# Temporary coarse surface mesh for pure CAD geometry inspection.",
+        "# The probe shells are deleted before this script ends.",
+        f"set probe_size {float(probe_element_size)}",
+        f"set probe_min_size {float(min_element_size)}",
+        f"set probe_max_size {max_size}",
+        f"set probe_max_dev {float(max_deviation)}",
+        f"set probe_feature_angle {float(max_feature_angle)}",
+        f"set probe_growth {float(growth_rate)}",
+        "proc mcp_mark_count {entity mark_id} {",
+        "    if {[catch {hm_marklength $entity $mark_id} n]} {return 0}",
+        "    return $n",
+        "}",
+        "proc mcp_all_elems {} {",
+        '    *createmark elems 1 "all"',
+        "    return [hm_getmark elems 1]",
+        "}",
+        "proc mcp_all_nodes {} {",
+        '    *createmark nodes 1 "all"',
+        "    return [hm_getmark nodes 1]",
+        "}",
+        "proc mcp_list_subtract {a b} {",
+        "    array set seen {}",
+        "    foreach x $b {set seen($x) 1}",
+        "    set out {}",
+        "    foreach x $a {if {![info exists seen($x)]} {lappend out $x}}",
+        "    return $out",
+        "}",
+        "proc mcp_delete_elems {elems} {",
+        "    if {[llength $elems] == 0} {return}",
+        "    eval *createmark elems 1 $elems",
+        "    catch {*deletemark elems 1}",
+        "}",
+        "proc mcp_delete_nodes {nodes} {",
+        "    if {[llength $nodes] == 0} {return}",
+        "    eval *createmark nodes 1 $nodes",
+        "    catch {*deletemark nodes 1}",
+        "}",
+        "proc mcp_probe_emit {sid surf_count elems probe_size} {",
+        "    set elem_count [llength $elems]",
+        "    set tri_count 0",
+        "    set quad_count 0",
+        "    set other_count 0",
+        "    array set node_seen {}",
+        "    foreach eid $elems {",
+        "        if {[catch {hm_getvalue elems id=$eid dataname=config} cfg]} {set cfg -1}",
+        "        if {$cfg == 104 || $cfg == 108} {",
+        "            incr quad_count",
+        "        } elseif {$cfg == 103 || $cfg == 106} {",
+        "            incr tri_count",
+        "        } else {",
+        "            incr other_count",
+        "        }",
+        "        if {![catch {hm_getvalue elems id=$eid dataname=nodes} elem_nodes]} {",
+        "            foreach nid $elem_nodes {set node_seen($nid) 1}",
+        "        }",
+        "    }",
+        "    set node_count [array size node_seen]",
+        "    set bbox_ok 0",
+        "    set dx 0.0; set dy 0.0; set dz 0.0; set diag 0.0",
+        "    set bbox {}",
+        "    if {$elem_count > 0} {",
+        "        eval *createmark elems 2 $elems",
+        "        if {![catch {hm_getboundingbox elems 2 0 0 0} bb]} {",
+        "            set bbox_ok 1",
+        "            set bbox $bb",
+        "            set dx [expr {abs([lindex $bb 3] - [lindex $bb 0])}]",
+        "            set dy [expr {abs([lindex $bb 4] - [lindex $bb 1])}]",
+        "            set dz [expr {abs([lindex $bb 5] - [lindex $bb 2])}]",
+        "            set diag [expr {sqrt($dx*$dx + $dy*$dy + $dz*$dz)}]",
+        "        }",
+        "    }",
+        "    set slender 0.0",
+        "    set dims [lsort -real [list $dx $dy $dz]]",
+        "    if {[lindex $dims 0] > 0} {set slender [expr {[lindex $dims 2] / [lindex $dims 0]}]}",
+        "    set complexity 0.0",
+        "    if {$diag > 0} {set complexity [expr {$elem_count / max(1.0, ($diag / $probe_size) * ($diag / $probe_size))}]}",
+        "    puts \"MCP_PROBE_SOLID id=$sid surf_count=$surf_count elem_count=$elem_count node_count=$node_count tri_count=$tri_count quad_count=$quad_count other_count=$other_count bbox_ok=$bbox_ok dx=$dx dy=$dy dz=$dz diag=$diag slender=$slender complexity=$complexity bbox={$bbox}\"",
+        "}",
+        'catch {*beginhistorystate "MCP geometry probe"}',
+        *solid_setup,
+        'puts "MCP_PROBE_BEGIN solid_count=[llength $target_solids] probe_size=$probe_size"',
+        "foreach sid $target_solids {",
+        "    *createmark solids 1 $sid",
+        "    if {[mcp_mark_count solids 1] == 0} {",
+        '        puts "MCP_PROBE_SOLID id=$sid missing=1"',
+        "        continue",
+        "    }",
+        "    *createmark surfs 1 \"by solids\" $sid",
+        "    set surf_count [mcp_mark_count surfs 1]",
+        "    if {$surf_count == 0} {",
+        '        puts "MCP_PROBE_SOLID id=$sid surf_count=0 elem_count=0 bbox_ok=0"',
+        "        continue",
+        "    }",
+        "    set before_elems [mcp_all_elems]",
+        "    set before_nodes [mcp_all_nodes]",
+        "    *createarray 3 0 0 0",
+        "    if {[catch {*defaultmeshsurf_growth 1 $probe_size 3 3 2 1 1 1 35 0 $probe_min_size $probe_max_size $probe_max_dev $probe_feature_angle $probe_growth 1 3 1 0} mesh_err]} {",
+        '        puts "MCP_PROBE_SOLID id=$sid surf_count=$surf_count elem_count=0 bbox_ok=0 mesh_error={$mesh_err}"',
+        "        continue",
+        "    }",
+        "    set new_elems [mcp_list_subtract [mcp_all_elems] $before_elems]",
+        "    set new_nodes [mcp_list_subtract [mcp_all_nodes] $before_nodes]",
+        "    mcp_probe_emit $sid $surf_count $new_elems $probe_size",
+        "    mcp_delete_elems $new_elems",
+        "    mcp_delete_nodes $new_nodes",
+        "}",
+        'puts "MCP_PROBE_END"',
+        'catch {*endhistorystate "MCP geometry probe"}',
+    ]
+    if output_hm_path:
+        lines.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
+
+    return {
+        "success": True,
+        "script": "\n".join(lines) + "\n",
+        "strategy": (
+            "Visual classification remains the first choice. Use this probe only "
+            "when screenshots/visual inspection are not enough or pure CAD Tcl "
+            "geometry queries return no size/type data. The probe creates temporary "
+            "coarse surface shells, emits MCP_PROBE_SOLID lines, and deletes the "
+            "temporary shell elements and nodes."
+        ),
+    }
 
 
 @mcp.tool()

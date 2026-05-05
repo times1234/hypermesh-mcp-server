@@ -33,6 +33,7 @@ refinement rules.
 - `get_meshing_rules`: return structured generic tetra/drag/spin rules.
 - `classify_hypermesh_part_strategy`: classify a part by geometry features.
 - `classify_hypermesh_model_parts`: classify every expected solid/component and fail if any object is skipped.
+- `generate_geometry_probe_tcl`: create temporary coarse surface meshes to probe pure CAD geometry, then delete them.
 - `generate_surface_automesh_tcl`: generate simple surface automesh Tcl.
 - `generate_surface_deviation_rtrias_tcl`: generate surface deviation + R-trias Tcl.
 - `generate_gear_aware_tetra_tcl`: generate gear/tooth local-refinement tetra Tcl.
@@ -47,17 +48,24 @@ Use `classify_hypermesh_part_strategy` and geometry facts, not component names.
 The intended order is:
 
 1. Enumerate all solids/components in the model.
-2. Inspect every object once and record geometry facts for each one.
-3. Run `classify_hypermesh_model_parts` with the full expected id list as a
+2. Try visual classification first. If screenshots or visible GUI inspection are
+   enough to identify drag/spin/tetra/gear/bearing/housing behavior, use that
+   judgment and do not run the probe.
+3. If visual inspection is uncertain, or pure CAD Tcl queries cannot return
+   bbox/type/dimension data, run one `generate_geometry_probe_tcl` script for
+   all relevant solids. It temporarily creates a coarse surface mesh, emits
+   `MCP_PROBE_SOLID` lines, and deletes the temporary shell elements and nodes.
+4. Inspect every object once and record geometry facts for each one.
+5. Run `classify_hypermesh_model_parts` with the full expected id list as a
    lightweight planning table. This is not a command to execute one Tcl script
    per object.
-4. Build one combined Tcl script when practical.
-5. In that combined script, attempt all structured hex candidates first:
+6. Build one combined Tcl script when practical.
+7. In that combined script, attempt all structured hex candidates first:
    `drag`, `spin`, and `cut-section spin`.
-6. If a hex candidate fails validation, queue that object for tetra fallback.
-7. After all hex candidates have been attempted, mesh the tetra queue and all
+8. If a hex candidate fails validation, queue that object for tetra fallback.
+9. After all hex candidates have been attempted, mesh the tetra queue and all
    tetra-only objects.
-8. For bearing/ring-like revolved bodies, do not stop after direct spin fails.
+10. For bearing/ring-like revolved bodies, do not stop after direct spin fails.
    Use a real cut plane through the rotation axis, mesh the true radial section,
    and spin that section before tetra fallback.
 
@@ -67,6 +75,21 @@ component name alone.
 Performance rule: avoid splitting the workflow into many `generate_*` and
 `execute_tcl_gui` calls. Generate Tcl blocks, concatenate them, and send one
 combined script to HyperMesh whenever possible.
+
+### Geometry Probe
+
+Use `generate_geometry_probe_tcl` only as a fallback when visual inspection is
+not enough or CAD-only Tcl geometry queries return empty values. The probe:
+
+- meshes each target solid's surfaces with a coarse temporary 2D mesh
+- reads bbox and simple size/complexity data from the temporary elements
+- prints parseable `MCP_PROBE_SOLID` lines
+- deletes the temporary probe elements and nodes before finishing
+
+Probe output helps infer rough geometry facts such as size ratios, coarse
+complexity, and whether a pure CAD solid can be treated as simple or complex.
+It is not a replacement for final mesh generation and should not be run per
+object when one combined probe script can cover all solids.
 
 ### Tetra
 
